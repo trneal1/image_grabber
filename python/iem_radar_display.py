@@ -13,9 +13,9 @@ Radar source : IEM NEXRAD N0Q CONUS Composite WMS
 Map base     : OpenStreetMap tiles (any zoom)
 Display      : raw RGB565 via the RGB! TCP protocol
                Header: MAGIC(4) + W(2BE) + H(2BE) + ROTATION(1) = 9 bytes
-               Image is pre-rotated before sending; W×H match the rotation:
-                 0=portrait 320×480  1=90° CW 480×320
-                 2=180°     320×480  3=270° CW 480×320
+               Image pixels are rotated in Python into the fixed 320×480
+               frame, then sent with display rotation 0 so the ESP32 draws
+               the bitmap as-is instead of only changing address order.
 
 Usage:
     python iem_radar_display.py --zip 27587 --host 192.168.1.42
@@ -115,9 +115,11 @@ def latlon_to_canvas_px(lat: float, lon: float,
 
 
 def crop_bbox_latlon(z: int, tx0: int, ty0: int,
-                     crop_left: int, crop_top: int) -> tuple[float, float, float, float]:
+                     crop_left: int, crop_top: int,
+                     crop_w: int = DISPLAY_W,
+                     crop_h: int = DISPLAY_H) -> tuple[float, float, float, float]:
     """
-    Return (min_lat, min_lon, max_lat, max_lon) for the DISPLAY_W × DISPLAY_H
+    Return (min_lat, min_lon, max_lat, max_lon) for the requested
     crop window in WGS-84 degrees.  Used to build the WMS BBOX.
     """
     n = 2 ** z
@@ -130,9 +132,9 @@ def crop_bbox_latlon(z: int, tx0: int, ty0: int,
         return math.degrees(math.atan(math.sinh(merc)))
 
     min_lon = px_to_lon(crop_left)
-    max_lon = px_to_lon(crop_left + DISPLAY_W)
+    max_lon = px_to_lon(crop_left + crop_w)
     max_lat = px_to_lat(crop_top)           # y increases downward
-    min_lat = px_to_lat(crop_top + DISPLAY_H)
+    min_lat = px_to_lat(crop_top + crop_h)
     return min_lat, min_lon, max_lat, max_lon
 
 
@@ -211,9 +213,11 @@ def fetch_iem_radar(min_lat: float, min_lon: float,
 
 def build_radar_image(lat: float, lon: float, zoom: int,
                       brightness: float = 1.0,
-                      radar_opacity: float = 1.0) -> Image.Image:
+                      radar_opacity: float = 1.0,
+                      width: int = DISPLAY_W,
+                      height: int = DISPLAY_H) -> Image.Image:
     """
-    Build a DISPLAY_W × DISPLAY_H composite:
+    Build a width × height composite:
       1. OSM base map (tiled, any zoom)
       2. IEM NEXRAD N0Q radar overlay (WMS bounding-box, any zoom, no cap)
       3. Yellow crosshair at ZIP centre
@@ -221,8 +225,8 @@ def build_radar_image(lat: float, lon: float, zoom: int,
     """
     # ── Tile grid ─────────────────────────────────────────────────────────
     cx_tile, cy_tile = deg2tile(lat, lon, zoom)
-    tiles_x = math.ceil(DISPLAY_W / TILE_SIZE) + 2
-    tiles_y = math.ceil(DISPLAY_H / TILE_SIZE) + 2
+    tiles_x = math.ceil(width / TILE_SIZE) + 2
+    tiles_y = math.ceil(height / TILE_SIZE) + 2
     tx0 = cx_tile - tiles_x // 2
     ty0 = cy_tile - tiles_y // 2
     canvas_w = tiles_x * TILE_SIZE
@@ -235,14 +239,14 @@ def build_radar_image(lat: float, lon: float, zoom: int,
 
     # ── Crop window centred on ZIP ────────────────────────────────────────
     px, py = latlon_to_canvas_px(lat, lon, zoom, tx0, ty0)
-    crop_left = int(px) - DISPLAY_W // 2
-    crop_top  = int(py) - DISPLAY_H // 2
-    crop_left = max(0, min(crop_left, canvas_w - DISPLAY_W))
-    crop_top  = max(0, min(crop_top,  canvas_h - DISPLAY_H))
+    crop_left = int(px) - width // 2
+    crop_top  = int(py) - height // 2
+    crop_left = max(0, min(crop_left, canvas_w - width))
+    crop_top  = max(0, min(crop_top,  canvas_h - height))
 
     # ── 2. IEM radar overlay ──────────────────────────────────────────────
     min_lat, min_lon, max_lat, max_lon = crop_bbox_latlon(
-        zoom, tx0, ty0, crop_left, crop_top)
+        zoom, tx0, ty0, crop_left, crop_top, width, height)
 
     print(f"  BBOX: {min_lat:.4f},{min_lon:.4f} → {max_lat:.4f},{max_lon:.4f}")
     print(f"  Fetching IEM NEXRAD N0Q …", end=" ", flush=True)
@@ -250,9 +254,9 @@ def build_radar_image(lat: float, lon: float, zoom: int,
     radar_ok = False
     try:
         radar = fetch_iem_radar(min_lat, min_lon, max_lat, max_lon,
-                                DISPLAY_W, DISPLAY_H)
+                                width, height)
         img = base.crop((crop_left, crop_top,
-                         crop_left + DISPLAY_W, crop_top + DISPLAY_H))
+                         crop_left + width, crop_top + height))
         # Apply base map brightness
         if brightness != 1.0:
             img = ImageEnhance.Brightness(img.convert("RGB")).enhance(brightness)
@@ -270,14 +274,14 @@ def build_radar_image(lat: float, lon: float, zoom: int,
         print(f"✗  {e}")
         # Fall back to base map only so the display still updates
         img = base.crop((crop_left, crop_top,
-                         crop_left + DISPLAY_W, crop_top + DISPLAY_H)
+                         crop_left + width, crop_top + height)
                         ).convert("RGB")
         if brightness != 1.0:
             img = ImageEnhance.Brightness(img).enhance(brightness)
 
     # ── 3. Crosshair ──────────────────────────────────────────────────────
     draw = ImageDraw.Draw(img)
-    cx, cy = DISPLAY_W // 2, DISPLAY_H // 2
+    cx, cy = width // 2, height // 2
     arm = 12
     draw.line([(cx - arm, cy), (cx + arm, cy)], fill=(255, 255, 0), width=2)
     draw.line([(cx, cy - arm), (cx, cy + arm)], fill=(255, 255, 0), width=2)
@@ -286,9 +290,9 @@ def build_radar_image(lat: float, lon: float, zoom: int,
 
     # ── 4. Info banner ─────────────────────────────────────────────────────
     banner_h = 24
-    banner = Image.new("RGBA", (DISPLAY_W, banner_h), (0, 0, 0, 190))
+    banner = Image.new("RGBA", (width, banner_h), (0, 0, 0, 190))
     img_rgba = img.convert("RGBA")
-    img_rgba.alpha_composite(banner, dest=(0, DISPLAY_H - banner_h))
+    img_rgba.alpha_composite(banner, dest=(0, height - banner_h))
     img = img_rgba.convert("RGB")
 
     draw = ImageDraw.Draw(img)
@@ -301,7 +305,7 @@ def build_radar_image(lat: float, lon: float, zoom: int,
     local_time = datetime.now().strftime("%m/%d %H:%M")
     status = "IEM N0Q" if radar_ok else "IEM N0Q (FAIL)"
     label = f"{status}  z{zoom}  {local_time}"
-    draw.text((4, DISPLAY_H - banner_h + 5), label,
+    draw.text((4, height - banner_h + 5), label,
               fill=(255, 255, 255), font=font)
 
     return img
@@ -326,6 +330,31 @@ def image_to_rgb565_rows(img: Image.Image) -> list[bytes]:
             row[x * 2 + 1] =  v       & 0xFF
         rows.append(bytes(row))
     return rows
+
+
+def rotate_image_pixels(img: Image.Image, rotation: int) -> Image.Image:
+    """Rotate the bitmap itself inside the physical 320x480 display frame."""
+    rotation = rotation % 4
+    if rotation == 0:
+        return img.convert("RGB")
+
+    if rotation == 1:
+        rotated = img.transpose(Image.Transpose.ROTATE_270)  # 90 degrees CW
+    elif rotation == 2:
+        rotated = img.transpose(Image.Transpose.ROTATE_180)
+    elif rotation == 3:
+        rotated = img.transpose(Image.Transpose.ROTATE_90)   # 270 degrees CW
+    else:
+        raise ValueError(f"invalid rotation {rotation}")
+
+    return rotated.convert("RGB")
+
+
+def source_size_for_rotation(rotation: int) -> tuple[int, int]:
+    """Return the image size to compose before rotating into 320x480."""
+    if rotation % 2:
+        return DISPLAY_H, DISPLAY_W
+    return DISPLAY_W, DISPLAY_H
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,15 +499,13 @@ def radar_worker(state: RadarState, esp_host: str, esp_port: int,
               f"bright={brightness:.2f}  opacity={radar_opacity:.2f}")
 
         try:
+            source_w, source_h = source_size_for_rotation(rotation)
             img = build_radar_image(lat, lon, zoom,
                                     brightness=brightness,
-                                    radar_opacity=radar_opacity)
-            if rotation == 1:
-                img = img.rotate(90,  expand=True)
-            elif rotation == 2:
-                img = img.rotate(180, expand=True)
-            elif rotation == 3:
-                img = img.rotate(270, expand=True)
+                                    radar_opacity=radar_opacity,
+                                    width=source_w,
+                                    height=source_h)
+            img = rotate_image_pixels(img, rotation)
         except Exception as e:
             print(f"   Build failed: {e}")
             state.set_status(f"Error: {e}")
@@ -487,7 +514,7 @@ def radar_worker(state: RadarState, esp_host: str, esp_port: int,
             continue
 
         state.set_status("Sending to display...")
-        ok = send_to_display(esp_host, esp_port, img, rotation=rotation)
+        ok = send_to_display(esp_host, esp_port, img, rotation=0)
 
         with state._lock:
             state.frame    += 1
