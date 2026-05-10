@@ -324,8 +324,8 @@ def image_to_rgb565_rows(img: Image.Image) -> list[bytes]:
         row = bytearray(w * 2)
         for x in range(w):
             r, g, b = pixels[x, y]
-            # BGR565: blue in high bits, red in low bits
-            v = ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3)
+            # RGB565: red in high bits, blue in low bits
+            v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
             row[x * 2]     = (v >> 8) & 0xFF
             row[x * 2 + 1] =  v       & 0xFF
         rows.append(bytes(row))
@@ -362,17 +362,27 @@ def source_size_for_rotation(rotation: int) -> tuple[int, int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_to_display(host: str, port: int, img: Image.Image,
-                    rotation: int = 0, timeout: int = 30) -> bool:
+                    rotation: int = 0, timeout: int = 30,
+                    connect_retries: int = 4,
+                    retry_delay: float = 3.0) -> bool:
     w, h   = img.size
     rows   = image_to_rgb565_rows(img)
     header = MAGIC + struct.pack(">HHB", w, h, rotation)
     total  = w * h * 2
 
-    print(f"  Connecting {host}:{port} …")
-    try:
-        sock = socket.create_connection((host, port), timeout=10)
-    except OSError as e:
-        print(f"  Connect failed: {e}")
+    sock = None
+    for attempt in range(1, connect_retries + 1):
+        print(f"  Connecting {host}:{port} "
+              f"(attempt {attempt}/{connect_retries}) …")
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            break
+        except OSError as e:
+            print(f"  Connect failed: {e}")
+            if attempt < connect_retries:
+                time.sleep(retry_delay)
+
+    if sock is None:
         return False
 
     sock.settimeout(timeout)

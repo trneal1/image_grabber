@@ -6,7 +6,7 @@
  * to a ST7796S SPI TFT via Adafruit_GFX on the HSPI bus.
  *
  * No large heap buffer is required.  The Python sender converts any source
- * image to raw RGB565 before sending, so the ESP32 only needs one
+ * image to raw RGB565 in RGB order before sending, so the ESP32 only needs one
  * scanline of RAM at a time (~640 bytes for a 320-px-wide row).
  *
  * ── Protocol ────────────────────────────────────────────────────────────────
@@ -16,6 +16,8 @@
  *    [2 bytes] height   : big-endian uint16
  *    [1 byte]  rotation : 0=portrait  1=90° CW  2=180°  3=270° CW
  *    [W*H*2 bytes]      : raw RGB565, big-endian, row-major, top-to-bottom
+ *                         Sender should pack pixels in RGB order:
+ *                         red high bits, green middle bits, blue low bits.
  *                         Image is pre-rotated by sender; W×H match rotation.
  *
  *  ESP32 → Python
@@ -68,6 +70,12 @@
 
 // Receive timeout, reset on each successful chunk read
 #define RECV_TIMEOUT_MS  15000
+// WiFi health check / reconnect timing
+#define WIFI_CHECK_INTERVAL_MS    5000
+#define WIFI_RECONNECT_TIMEOUT_MS 20000
+// Refresh the TCP listener periodically; this helps recover from rare ESP32
+// WiFiServer stalls where WiFi still reports connected but SYNs time out.
+#define SERVER_REFRESH_INTERVAL_MS 30000
 // ─────────────────────────────────────────────────────────────────────────────
 
 static const uint8_t MAGIC[4] = {'R', 'G', 'B', '!'};
@@ -80,6 +88,9 @@ static const uint8_t MAGIC[4] = {'R', 'G', 'B', '!'};
 SPIClass         hspi(HSPI);
 Adafruit_ST7796S tft(&hspi, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
 WiFiServer       server(TCP_PORT);
+static bool      serverStarted = false;
+static uint32_t  lastWiFiCheck = 0;
+static uint32_t  lastServerRefresh = 0;
 
 // ── Scanline receive buffer ───────────────────────────────────────────────────
 // One row at a time; up to MAX_IMG_DIM (480) pixels × 2 bytes = 960 bytes.
@@ -115,6 +126,77 @@ void showStatus(const char* line1, const char* line2 = nullptr)
     if (line2) { tft.setCursor(4, 32); tft.print(line2); }
 }
 
+void startTcpServer()
+{
+    server.begin();
+    server.setNoDelay(true);
+    serverStarted = true;
+    lastServerRefresh = millis();
+    Serial.printf("TCP server ready on port %d\n", TCP_PORT);
+}
+
+bool connectWiFi(uint32_t timeoutMs)
+{
+    Serial.printf("Connecting to %s\n", WIFI_SSID);
+    WiFi.disconnect(false);
+    delay(100);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    uint32_t start = millis();
+    uint8_t dots = 0;
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+        delay(500);
+        Serial.print('.');
+        tft.setCursor(4 + (dots % 14) * 12, 32);
+        tft.print('.');
+        dots++;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi connect timed out");
+        return false;
+    }
+
+    String ip = WiFi.localIP().toString();
+    Serial.printf("\nIP: %s\n", ip.c_str());
+    Serial.printf("Free heap after WiFi: %u bytes\n", ESP.getFreeHeap());
+    return true;
+}
+
+bool ensureWiFiConnected()
+{
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!serverStarted) startTcpServer();
+        uint32_t now = millis();
+        if (now - lastServerRefresh >= SERVER_REFRESH_INTERVAL_MS) {
+            Serial.println("Refreshing TCP listener");
+            startTcpServer();
+        }
+        return true;
+    }
+
+    uint32_t now = millis();
+    if (now - lastWiFiCheck < WIFI_CHECK_INTERVAL_MS) return false;
+    lastWiFiCheck = now;
+
+    serverStarted = false;
+    Serial.println("WiFi disconnected; reconnecting");
+    showStatus("WiFi lost", "Reconnecting...");
+
+    if (!connectWiFi(WIFI_RECONNECT_TIMEOUT_MS)) {
+        showStatus("WiFi reconnect", "failed");
+        return false;
+    }
+
+    startTcpServer();
+
+    String ip = WiFi.localIP().toString();
+    char portStr[20];
+    snprintf(portStr, sizeof(portStr), "Port %d", TCP_PORT);
+    showStatus(ip.c_str(), portStr);
+    return true;
+}
+
 // ── setup() ──────────────────────────────────────────────────────────────────
 void setup()
 {
@@ -142,38 +224,37 @@ void setup()
     tft.print("Connecting WiFi");
 
     // ── WiFi ──────────────────────────────────────────────────────────────
-    Serial.printf("Connecting to %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    uint8_t dots = 0;
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print('.');
-        tft.setCursor(4 + (dots % 14) * 12, 32);
-        tft.print('.');
-        dots++;
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    while (!connectWiFi(WIFI_RECONNECT_TIMEOUT_MS)) {
+        showStatus("WiFi failed", "Retrying...");
+        delay(2000);
     }
 
-    String ip = WiFi.localIP().toString();
-    Serial.printf("\nIP: %s\n", ip.c_str());
-    Serial.printf("Free heap after WiFi: %u bytes\n", ESP.getFreeHeap());
-
     // ── TCP server ────────────────────────────────────────────────────────
-    server.begin();
-    server.setNoDelay(true);
+    startTcpServer();
 
+    String ip = WiFi.localIP().toString();
     char portStr[20];
     snprintf(portStr, sizeof(portStr), "Port %d", TCP_PORT);
     showStatus(ip.c_str(), portStr);
-    Serial.printf("TCP server ready on port %d\n", TCP_PORT);
 }
 
 // ── loop() ───────────────────────────────────────────────────────────────────
 void loop()
 {
+    if (!ensureWiFiConnected()) {
+        delay(50);
+        return;
+    }
+
     WiFiClient client = server.accept();
-    if (!client) return;
+    if (!client) {
+        delay(5);
+        return;
+    }
+    client.setNoDelay(true);
 
     String remoteIP = client.remoteIP().toString();
     Serial.printf("\nClient: %s\n", remoteIP.c_str());
@@ -216,7 +297,7 @@ void loop()
     tft.setRotation(imgRot);
 
     // ── 3. Stream rows directly to the display ────────────────────────────
-    // Each row: imgW × 2 bytes, big-endian RGB565.
+    // Each row: imgW × 2 bytes, big-endian RGB565 in RGB order.
     // We receive one row, byte-swap to little-endian, and blit immediately.
     // Peak extra RAM used: 640 bytes (rowBuf). No bulk buffer needed.
     for (uint16_t y = 0; y < imgH; y++) {
