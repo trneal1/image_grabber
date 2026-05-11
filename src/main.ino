@@ -70,6 +70,8 @@
 
 // Receive timeout, reset on each successful chunk read
 #define RECV_TIMEOUT_MS  15000
+// Close a connected client that goes quiet between transfers.
+#define TCP_CLIENT_IDLE_TIMEOUT_MS 120000UL
 // WiFi health check / reconnect timing
 #define WIFI_CHECK_INTERVAL_MS    5000
 #define WIFI_RECONNECT_TIMEOUT_MS 20000
@@ -88,9 +90,11 @@ static const uint8_t MAGIC[4] = {'R', 'G', 'B', '!'};
 SPIClass         hspi(HSPI);
 Adafruit_ST7796S tft(&hspi, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
 WiFiServer       server(TCP_PORT);
+WiFiClient       client;
 static bool      serverStarted = false;
 static uint32_t  lastWiFiCheck = 0;
 static uint32_t  lastServerRefresh = 0;
+static uint32_t  lastClientActivityMs = 0;
 
 // ── Scanline receive buffer ───────────────────────────────────────────────────
 // One row at a time; up to MAX_IMG_DIM (480) pixels × 2 bytes = 960 bytes.
@@ -99,24 +103,59 @@ static uint16_t rowBuf[MAX_IMG_DIM];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-bool tcpReadExact(WiFiClient& client, uint8_t* dst, uint32_t len)
+void showStatus(const char* line1, const char* line2 = nullptr);
+
+void closeClient(const char* reason)
+{
+    if (client) {
+        Serial.printf("Client closed: %s\n", reason);
+        client.stop();
+    }
+    lastClientActivityMs = 0;
+}
+
+bool tcpReadExact(uint8_t* dst, uint32_t len)
 {
     uint32_t deadline = millis() + RECV_TIMEOUT_MS;
     uint32_t got = 0;
     while (got < len) {
-        if (!client.connected() || millis() > deadline) return false;
+        uint32_t now = millis();
+        if ((int32_t)(now - deadline) > 0) return false;
+
         int avail = client.available();
-        if (avail <= 0) { delay(1); continue; }
+        if (avail <= 0) {
+            if (!client.connected()) return false;
+            delay(1);
+            yield();
+            continue;
+        }
+
         uint32_t want  = len - got;
         uint32_t chunk = ((uint32_t)avail < want) ? (uint32_t)avail : want;
-        client.readBytes(dst + got, chunk);
-        got += chunk;
+        int readNow = client.read(dst + got, chunk);
+        if (readNow <= 0) {
+            delay(1);
+            yield();
+            continue;
+        }
+
+        got += (uint32_t)readNow;
         deadline = millis() + RECV_TIMEOUT_MS;
+        lastClientActivityMs = millis();
+        yield();
     }
     return true;
 }
 
-void showStatus(const char* line1, const char* line2 = nullptr)
+void sendErrorAndClose(const char* displayLine, const char* logLine)
+{
+    Serial.println(logLine);
+    if (client && client.connected()) client.print("ERR\n");
+    closeClient(logLine);
+    showStatus(displayLine);
+}
+
+void showStatus(const char* line1, const char* line2)
 {
     tft.fillScreen(COLOR_BLACK);
     tft.setTextColor(COLOR_WHITE);
@@ -180,6 +219,7 @@ bool ensureWiFiConnected()
     lastWiFiCheck = now;
 
     serverStarted = false;
+    closeClient("WiFi disconnected");
     Serial.println("WiFi disconnected; reconnecting");
     showStatus("WiFi lost", "Reconnecting...");
 
@@ -195,6 +235,70 @@ bool ensureWiFiConnected()
     snprintf(portStr, sizeof(portStr), "Port %d", TCP_PORT);
     showStatus(ip.c_str(), portStr);
     return true;
+}
+
+void handleClientImage()
+{
+    String remoteIP = client.remoteIP().toString();
+    Serial.printf("\nClient: %s\n", remoteIP.c_str());
+    showStatus("Receiving...", remoteIP.c_str());
+
+    // ── 1. Magic ──────────────────────────────────────────────────────────
+    uint8_t magic[4] = {0};
+    if (!tcpReadExact(magic, 4) || memcmp(magic, MAGIC, 4) != 0) {
+        sendErrorAndClose("ERR: bad magic", "ERR: bad magic");
+        return;
+    }
+
+    // ── 2. Dimensions + rotation (W:2, H:2, rot:1 bytes) ────────────────
+    uint8_t hdrBuf[5] = {0};
+    if (!tcpReadExact(hdrBuf, 5)) {
+        sendErrorAndClose("ERR: timeout", "ERR: timeout reading header");
+        return;
+    }
+    uint16_t imgW    = ((uint16_t)hdrBuf[0] << 8) | hdrBuf[1];
+    uint16_t imgH    = ((uint16_t)hdrBuf[2] << 8) | hdrBuf[3];
+    uint8_t  imgRot  = hdrBuf[4];
+    Serial.printf("Image: %u x %u  rot=%u\n", imgW, imgH, imgRot);
+
+    if (imgW == 0 || imgW > MAX_IMG_DIM || imgH == 0 || imgH > MAX_IMG_DIM) {
+        Serial.printf("ERR: dimensions %ux%u out of range\n", imgW, imgH);
+        sendErrorAndClose("ERR: bad size", "ERR: bad size");
+        return;
+    }
+    if (imgRot > 3) {
+        Serial.printf("ERR: invalid rotation %u\n", imgRot);
+        sendErrorAndClose("ERR: bad rot", "ERR: bad rot");
+        return;
+    }
+    tft.setRotation(imgRot);
+
+    // ── 3. Stream rows directly to the display ────────────────────────────
+    // Each row: imgW × 2 bytes, big-endian RGB565 in RGB order.
+    // We receive one row, byte-swap to little-endian, and blit immediately.
+    // Peak extra RAM used: 640 bytes (rowBuf). No bulk buffer needed.
+    for (uint16_t y = 0; y < imgH; y++) {
+
+        if (!tcpReadExact((uint8_t*)rowBuf, (uint32_t)imgW * 2)) {
+            Serial.printf("ERR: timeout on row %u\n", y);
+            sendErrorAndClose("ERR: row timeout", "ERR: row timeout");
+            return;
+        }
+
+        // Network byte order (big-endian) → Adafruit_GFX (little-endian)
+        for (uint16_t x = 0; x < imgW; x++) {
+            uint16_t px = rowBuf[x];
+            rowBuf[x]   = (uint16_t)((px >> 8) | (px << 8));
+        }
+
+        tft.drawRGBBitmap(0, (int16_t)y, rowBuf, imgW, 1);
+        yield();
+    }
+
+    // ── 4. Acknowledge ────────────────────────────────────────────────────
+    if (client && client.connected()) client.print("OK\n");
+    closeClient("image complete");
+    Serial.println("Image displayed OK");
 }
 
 // ── setup() ──────────────────────────────────────────────────────────────────
@@ -249,77 +353,29 @@ void loop()
         return;
     }
 
-    WiFiClient client = server.accept();
     if (!client) {
-        delay(5);
-        return;
-    }
-    client.setNoDelay(true);
-
-    String remoteIP = client.remoteIP().toString();
-    Serial.printf("\nClient: %s\n", remoteIP.c_str());
-    showStatus("Receiving...", remoteIP.c_str());
-
-    // ── 1. Magic ──────────────────────────────────────────────────────────
-    uint8_t magic[4] = {0};
-    if (!tcpReadExact(client, magic, 4) || memcmp(magic, MAGIC, 4) != 0) {
-        Serial.println("ERR: bad magic");
-        client.print("ERR\n"); client.stop();
-        showStatus("ERR: bad magic");
-        return;
-    }
-
-    // ── 2. Dimensions + rotation (W:2, H:2, rot:1 bytes) ────────────────
-    uint8_t hdrBuf[5] = {0};
-    if (!tcpReadExact(client, hdrBuf, 5)) {
-        Serial.println("ERR: timeout reading header");
-        client.print("ERR\n"); client.stop();
-        showStatus("ERR: timeout");
-        return;
-    }
-    uint16_t imgW    = ((uint16_t)hdrBuf[0] << 8) | hdrBuf[1];
-    uint16_t imgH    = ((uint16_t)hdrBuf[2] << 8) | hdrBuf[3];
-    uint8_t  imgRot  = hdrBuf[4];
-    Serial.printf("Image: %u x %u  rot=%u\n", imgW, imgH, imgRot);
-
-    if (imgW == 0 || imgW > MAX_IMG_DIM || imgH == 0 || imgH > MAX_IMG_DIM) {
-        Serial.printf("ERR: dimensions %ux%u out of range\n", imgW, imgH);
-        client.print("ERR\n"); client.stop();
-        showStatus("ERR: bad size");
-        return;
-    }
-    if (imgRot > 3) {
-        Serial.printf("ERR: invalid rotation %u\n", imgRot);
-        client.print("ERR\n"); client.stop();
-        showStatus("ERR: bad rot");
-        return;
-    }
-    tft.setRotation(imgRot);
-
-    // ── 3. Stream rows directly to the display ────────────────────────────
-    // Each row: imgW × 2 bytes, big-endian RGB565 in RGB order.
-    // We receive one row, byte-swap to little-endian, and blit immediately.
-    // Peak extra RAM used: 640 bytes (rowBuf). No bulk buffer needed.
-    for (uint16_t y = 0; y < imgH; y++) {
-
-        if (!tcpReadExact(client, (uint8_t*)rowBuf, (uint32_t)imgW * 2)) {
-            Serial.printf("ERR: timeout on row %u\n", y);
-            client.print("ERR\n"); client.stop();
-            showStatus("ERR: row timeout");
-            return;
+        WiFiClient incoming = server.accept();
+        if (incoming) {
+            client = incoming;
+            client.setNoDelay(true);
+            lastClientActivityMs = millis();
+        } else {
+            delay(5);
         }
-
-        // Network byte order (big-endian) → Adafruit_GFX (little-endian)
-        for (uint16_t x = 0; x < imgW; x++) {
-            uint16_t px = rowBuf[x];
-            rowBuf[x]   = (uint16_t)((px >> 8) | (px << 8));
-        }
-
-        tft.drawRGBBitmap(0, (int16_t)y, rowBuf, imgW, 1);
+        return;
     }
 
-    // ── 4. Acknowledge ────────────────────────────────────────────────────
-    client.print("OK\n");
-    client.stop();
-    Serial.println("Image displayed OK");
+    if (!client.connected() && client.available() <= 0) {
+        closeClient("disconnected");
+        return;
+    }
+
+    uint32_t now = millis();
+    if (lastClientActivityMs != 0 &&
+        (uint32_t)(now - lastClientActivityMs) > TCP_CLIENT_IDLE_TIMEOUT_MS) {
+        closeClient("idle timeout");
+        return;
+    }
+
+    handleClientImage();
 }
