@@ -70,8 +70,6 @@
 
 // Receive timeout, reset on each successful chunk read
 #define RECV_TIMEOUT_MS  15000
-// Close a connected client that goes quiet between transfers.
-#define TCP_CLIENT_IDLE_TIMEOUT_MS 120000UL
 // WiFi health check / reconnect timing
 #define WIFI_CHECK_INTERVAL_MS    5000
 #define WIFI_RECONNECT_TIMEOUT_MS 20000
@@ -94,7 +92,6 @@ WiFiClient       client;
 static bool      serverStarted = false;
 static uint32_t  lastWiFiCheck = 0;
 static uint32_t  lastServerRefresh = 0;
-static uint32_t  lastClientActivityMs = 0;
 
 // ── Scanline receive buffer ───────────────────────────────────────────────────
 // One row at a time; up to MAX_IMG_DIM (480) pixels × 2 bytes = 960 bytes.
@@ -111,7 +108,6 @@ void closeClient(const char* reason)
         Serial.printf("Client closed: %s\n", reason);
         client.stop();
     }
-    lastClientActivityMs = 0;
 }
 
 bool tcpReadExact(uint8_t* dst, uint32_t len)
@@ -141,7 +137,6 @@ bool tcpReadExact(uint8_t* dst, uint32_t len)
 
         got += (uint32_t)readNow;
         deadline = millis() + RECV_TIMEOUT_MS;
-        lastClientActivityMs = millis();
         yield();
     }
     return true;
@@ -241,7 +236,6 @@ void handleClientImage()
 {
     String remoteIP = client.remoteIP().toString();
     Serial.printf("\nClient: %s\n", remoteIP.c_str());
-    showStatus("Receiving...", remoteIP.c_str());
 
     // ── 1. Magic ──────────────────────────────────────────────────────────
     uint8_t magic[4] = {0};
@@ -271,6 +265,8 @@ void handleClientImage()
         sendErrorAndClose("ERR: bad rot", "ERR: bad rot");
         return;
     }
+
+    showStatus("Receiving...", remoteIP.c_str());
     tft.setRotation(imgRot);
 
     // ── 3. Stream rows directly to the display ────────────────────────────
@@ -358,7 +354,6 @@ void loop()
         if (incoming) {
             client = incoming;
             client.setNoDelay(true);
-            lastClientActivityMs = millis();
         } else {
             delay(5);
         }
@@ -370,10 +365,8 @@ void loop()
         return;
     }
 
-    uint32_t now = millis();
-    if (lastClientActivityMs != 0 &&
-        (uint32_t)(now - lastClientActivityMs) > TCP_CLIENT_IDLE_TIMEOUT_MS) {
-        closeClient("idle timeout");
+    if (client.available() <= 0) {
+        delay(5);
         return;
     }
 
