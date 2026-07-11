@@ -75,9 +75,28 @@ IEM_LAYER = "nexrad-n0q-900913"   # the single composite layer this CGI exposes
 # Nominatim ZIP → lat/lon
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
+# NWS active alerts GeoJSON.  Alert geometries are drawn as outlines on the
+# radar map when enabled.
+NWS_ALERTS = "https://api.weather.gov/alerts/active"
+NWS_ALERT_COLORS = {
+    "statement": (40, 110, 235),
+    "advisory":  (42, 170, 84),
+    "watch":     (245, 214, 55),
+    "warning":   (225, 38, 38),
+}
+NWS_ALERT_PRIORITY = {
+    "statement": 1,
+    "advisory":  2,
+    "watch":     3,
+    "warning":   4,
+}
+
 # ── Shared HTTP session ───────────────────────────────────────────────────────
 _session = requests.Session()
-_session.headers.update({"User-Agent": "ESP32-IEMRadar/1.0"})
+_session.headers.update({
+    "User-Agent": "ESP32-IEMRadar/1.0",
+    "Accept": "application/geo+json, application/json, image/png, */*",
+})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Geo helpers
@@ -208,20 +227,108 @@ def fetch_iem_radar(min_lat: float, min_lon: float,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# NWS alert polygons
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify_nws_alert(event: str) -> str | None:
+    event = event.lower()
+    if "warning" in event:
+        return "warning"
+    if "watch" in event:
+        return "watch"
+    if "statement" in event:
+        return "statement"
+    if "advisory" in event:
+        return "advisory"
+    return None
+
+
+def iter_geojson_rings(geometry: dict):
+    geom_type = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+    if geom_type == "Polygon":
+        for ring in coords:
+            yield ring
+    elif geom_type == "MultiPolygon":
+        for polygon in coords:
+            for ring in polygon:
+                yield ring
+
+
+def ring_intersects_bbox(ring, min_lat: float, min_lon: float,
+                         max_lat: float, max_lon: float) -> bool:
+    if not ring:
+        return False
+    lons = [pt[0] for pt in ring if len(pt) >= 2]
+    lats = [pt[1] for pt in ring if len(pt) >= 2]
+    if not lons or not lats:
+        return False
+    return not (
+        max(lons) < min_lon or min(lons) > max_lon or
+        max(lats) < min_lat or min(lats) > max_lat
+    )
+
+
+def fetch_nws_alert_polygons(min_lat: float, min_lon: float,
+                             max_lat: float, max_lon: float) -> list[dict]:
+    r = _session.get(NWS_ALERTS, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+
+    alerts = []
+    for feature in data.get("features", []):
+        props = feature.get("properties", {})
+        level = classify_nws_alert(props.get("event", ""))
+        if level is None:
+            continue
+        geometry = feature.get("geometry") or {}
+        rings = [
+            ring for ring in iter_geojson_rings(geometry)
+            if ring_intersects_bbox(ring, min_lat, min_lon, max_lat, max_lon)
+        ]
+        if rings:
+            alerts.append({"level": level, "rings": rings})
+
+    alerts.sort(key=lambda item: NWS_ALERT_PRIORITY[item["level"]])
+    return alerts
+
+
+def draw_nws_alert_polygons(draw: ImageDraw.ImageDraw, alerts: list[dict],
+                            zoom: int, tx0: int, ty0: int,
+                            crop_left: int, crop_top: int,
+                            width: int, height: int) -> int:
+    drawn = 0
+    line_w = 2 if min(width, height) <= 320 else 3
+    for alert in alerts:
+        color = NWS_ALERT_COLORS[alert["level"]]
+        for ring in alert["rings"]:
+            points = []
+            for lon, lat, *_ in ring:
+                x, y = latlon_to_canvas_px(lat, lon, zoom, tx0, ty0)
+                points.append((round(x - crop_left), round(y - crop_top)))
+            if len(points) >= 2:
+                draw.line(points + [points[0]], fill=color, width=line_w)
+                drawn += 1
+    return drawn
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Image composition
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_radar_image(lat: float, lon: float, zoom: int,
                       brightness: float = 1.0,
                       radar_opacity: float = 1.0,
+                      alert_polygons: bool = False,
                       width: int = DISPLAY_W,
                       height: int = DISPLAY_H) -> Image.Image:
     """
     Build a width × height composite:
       1. OSM base map (tiled, any zoom)
       2. IEM NEXRAD N0Q radar overlay (WMS bounding-box, any zoom, no cap)
-      3. Yellow crosshair at ZIP centre
-      4. Timestamp + source banner
+      3. Optional NWS warning/watch/statement/advisory polygon outlines
+      4. Yellow crosshair at ZIP centre
+      5. Timestamp + source banner
     """
     # ── Tile grid ─────────────────────────────────────────────────────────
     cx_tile, cy_tile = deg2tile(lat, lon, zoom)
@@ -279,8 +386,20 @@ def build_radar_image(lat: float, lon: float, zoom: int,
         if brightness != 1.0:
             img = ImageEnhance.Brightness(img).enhance(brightness)
 
-    # ── 3. Crosshair ──────────────────────────────────────────────────────
+    # ── 3. NWS alert polygon outlines ─────────────────────────────────────
     draw = ImageDraw.Draw(img)
+    alert_count = 0
+    if alert_polygons:
+        print("  Fetching NWS alert polygons ...", end=" ", flush=True)
+        try:
+            alerts = fetch_nws_alert_polygons(min_lat, min_lon, max_lat, max_lon)
+            alert_count = draw_nws_alert_polygons(
+                draw, alerts, zoom, tx0, ty0, crop_left, crop_top, width, height)
+            print(f"{alert_count} outline(s)")
+        except Exception as e:
+            print(f"failed: {e}")
+
+    # ── 4. Crosshair ──────────────────────────────────────────────────────
     cx, cy = width // 2, height // 2
     arm = 12
     draw.line([(cx - arm, cy), (cx + arm, cy)], fill=(255, 255, 0), width=2)
@@ -288,7 +407,7 @@ def build_radar_image(lat: float, lon: float, zoom: int,
     draw.ellipse([cx - arm, cy - arm, cx + arm, cy + arm],
                  outline=(255, 255, 0), width=1)
 
-    # ── 4. Info banner ─────────────────────────────────────────────────────
+    # ── 5. Info banner ─────────────────────────────────────────────────────
     banner_h = 24
     banner = Image.new("RGBA", (width, banner_h), (0, 0, 0, 190))
     img_rgba = img.convert("RGBA")
@@ -304,7 +423,8 @@ def build_radar_image(lat: float, lon: float, zoom: int,
 
     local_time = datetime.now().strftime("%m/%d %H:%M")
     status = "IEM N0Q" if radar_ok else "IEM N0Q (FAIL)"
-    label = f"{status}  z{zoom}  {local_time}"
+    alerts_label = f"  NWS {alert_count}" if alert_polygons else ""
+    label = f"{status}  z{zoom}{alerts_label}  {local_time}"
     draw.text((4, height - banner_h + 5), label,
               fill=(255, 255, 255), font=font)
 
@@ -419,6 +539,49 @@ def send_to_display(host: str, port: int, img: Image.Image,
         sock.close()
 
 
+def encode_rgb_image_page(img: Image.Image, rotation: int = 0) -> bytes:
+    """Return the RGB! image frame understood by the direct TCP and channel firmware."""
+    w, h = img.size
+    rows = image_to_rgb565_rows(img)
+    return MAGIC + struct.pack(">HHB", w, h, rotation) + b"".join(rows)
+
+
+def read_channel_greeting(sock: socket.socket) -> None:
+    old_timeout = sock.gettimeout()
+    try:
+        sock.settimeout(0.2)
+        try:
+            data = sock.recv(4096)
+        except socket.timeout:
+            return
+        if data:
+            text = data.decode("utf-8", errors="replace").strip()
+            if text:
+                print(f"  Channel server: {text}")
+    finally:
+        sock.settimeout(old_timeout)
+
+
+def publish_to_channel_server(host: str, port: int, channel: str, payload: bytes,
+                              timeout: int = 30) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=10) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(f"PUB {channel}\n".encode("utf-8"))
+            read_channel_greeting(sock)
+            sock.sendall(payload)
+        return True
+    except OSError as e:
+        print(f"  Channel publish failed: {e}")
+        return False
+
+
+def publish_control_channels(host: str, port: int, control_channel: str,
+                             channels: list[str]) -> bool:
+    payload = json.dumps(channels, separators=(",", ":")).encode("utf-8")
+    return publish_to_channel_server(host, port, control_channel, payload)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,7 +593,7 @@ def send_to_display(host: str, port: int, img: Image.Image,
 
 class RadarState:
     def __init__(self, zipcode, zoom, rotation, interval, lat, lon,
-                 brightness=1.0, radar_opacity=1.0):
+                 brightness=1.0, radar_opacity=1.0, alert_polygons=False):
         self._lock        = threading.Lock()
         self.zipcode      = zipcode
         self.zoom         = zoom
@@ -440,6 +603,7 @@ class RadarState:
         self.lon          = lon
         self.brightness   = brightness    # 0.5–2.0, 1.0 = no change
         self.radar_opacity = radar_opacity # 0.0–1.0, 1.0 = fully opaque
+        self.alert_polygons = alert_polygons
         self.status       = "Starting..."
         self.last_sent    = None
         self.frame        = 0
@@ -448,10 +612,11 @@ class RadarState:
         with self._lock:
             return (self.zipcode, self.zoom, self.rotation,
                     self.interval, self.lat, self.lon,
-                    self.brightness, self.radar_opacity)
+                    self.brightness, self.radar_opacity,
+                    self.alert_polygons)
 
     def update(self, zipcode=None, zoom=None, rotation=None, interval=None,
-               brightness=None, radar_opacity=None):
+               brightness=None, radar_opacity=None, alert_polygons=None):
         """Update one or more fields.  Re-resolves ZIP if it changed.
         Returns an error string on failure, or None on success."""
         with self._lock:
@@ -468,6 +633,7 @@ class RadarState:
             if interval      is not None: self.interval      = interval
             if brightness    is not None: self.brightness    = brightness
             if radar_opacity is not None: self.radar_opacity = radar_opacity
+            if alert_polygons is not None: self.alert_polygons = alert_polygons
         return None
 
     def set_status(self, msg):
@@ -483,6 +649,7 @@ class RadarState:
                 "interval":     self.interval,
                 "brightness":   round(self.brightness, 2),
                 "radar_opacity": round(self.radar_opacity, 2),
+                "alert_polygons": self.alert_polygons,
                 "lat":          round(self.lat, 4),
                 "lon":          round(self.lon, 4),
                 "status":       self.status,
@@ -496,23 +663,27 @@ class RadarState:
 # Radar worker thread
 # ─────────────────────────────────────────────────────────────────────────────
 
-def radar_worker(state: RadarState, esp_host: str, esp_port: int,
-                 trigger: threading.Event):
+def radar_worker(state: RadarState, esp_host: str | None, esp_port: int,
+                 trigger: threading.Event, channel_host: str | None = None,
+                 channel_port: int = 9000, channel_name: str = "radar"):
     """Runs forever.  Wakes on trigger (immediate update) or interval timeout."""
     while True:
-        zipcode, zoom, rotation, interval, lat, lon, brightness, radar_opacity = state.get()
+        (zipcode, zoom, rotation, interval, lat, lon, brightness,
+         radar_opacity, alert_polygons) = state.get()
 
         state.set_status("Fetching radar...")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n-- Frame {state.frame + 1}  {ts} --")
         print(f"   ZIP={zipcode}  zoom={zoom}  rotation={rotation}  "
-              f"bright={brightness:.2f}  opacity={radar_opacity:.2f}")
+              f"bright={brightness:.2f}  opacity={radar_opacity:.2f}  "
+              f"alerts={'on' if alert_polygons else 'off'}")
 
         try:
             source_w, source_h = source_size_for_rotation(rotation)
             img = build_radar_image(lat, lon, zoom,
                                     brightness=brightness,
                                     radar_opacity=radar_opacity,
+                                    alert_polygons=alert_polygons,
                                     width=source_w,
                                     height=source_h)
             img = rotate_image_pixels(img, rotation)
@@ -523,8 +694,14 @@ def radar_worker(state: RadarState, esp_host: str, esp_port: int,
             trigger.clear()
             continue
 
-        state.set_status("Sending to display...")
-        ok = send_to_display(esp_host, esp_port, img, rotation=0)
+        if channel_host:
+            state.set_status("Publishing image channel...")
+            payload = encode_rgb_image_page(img, rotation=0)
+            ok = publish_to_channel_server(channel_host, channel_port,
+                                           channel_name, payload)
+        else:
+            state.set_status("Sending to display...")
+            ok = send_to_display(esp_host, esp_port, img, rotation=0)
 
         with state._lock:
             state.frame    += 1
@@ -574,6 +751,12 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;heigh
       border-radius:50%;background:#38bdf8;cursor:pointer}
 input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;
       background:#38bdf8;cursor:pointer;border:none}
+.checkrow{display:flex;align-items:center;gap:10px;margin:0 0 18px;
+      padding:11px 12px;border:1px solid #334155;border-radius:8px;
+      background:#0f172a}
+.checkrow input{width:18px;height:18px;accent-color:#38bdf8}
+.checkrow label{margin:0;color:#e2e8f0;text-transform:none;letter-spacing:0;
+      font-size:.92rem}
 button{width:100%;padding:12px;border-radius:8px;border:none;
        background:#0ea5e9;color:#fff;font-size:1rem;font-weight:600;
        cursor:pointer;transition:background .15s;margin-top:6px}
@@ -643,6 +826,11 @@ button:disabled{background:#334155;cursor:not-allowed}
            oninput="document.getElementById('opacityVal').textContent=parseFloat(this.value).toFixed(2)">
   </div>
 
+  <div class="checkrow">
+    <input id="alert_polygons" type="checkbox">
+    <label for="alert_polygons">NWS warning/watch/statement/advisory outlines</label>
+  </div>
+
   <button id="btn" onclick="apply()">&#9654; Apply &amp; Update Display Now</button>
 
   <div class="box" id="box"><div><span class="dot"></span>Loading...</div></div>
@@ -662,6 +850,8 @@ async function poll(){
     setVal('zoom',d.zoom);
     setVal('rotation',d.rotation);
     setVal('interval',d.interval);
+    const alertEl=document.getElementById('alert_polygons');
+    if(alertEl&&alertEl!==active) alertEl.checked=!!d.alert_polygons;
     const bv=parseFloat(d.brightness).toFixed(2);
     const ov=parseFloat(d.radar_opacity).toFixed(2);
     // Sliders: skip update while user is dragging (focus check)
@@ -681,7 +871,8 @@ async function poll(){
       'background:#334155;border-radius:4px;padding:1px 6px">'+d.lat+', '+d.lon+'</span></div>'+
       '<div>Zoom <span>'+d.zoom+'</span> &nbsp; Rotation <span>'+(d.rotation*90)+
       '&deg;</span> &nbsp; Interval <span>'+d.interval+'s</span></div>'+
-      '<div>Brightness <span>'+bv+'</span> &nbsp; Radar Opacity <span>'+ov+'</span></div>'+
+      '<div>Brightness <span>'+bv+'</span> &nbsp; Radar Opacity <span>'+ov+
+      '</span> &nbsp; NWS <span>'+(d.alert_polygons?'On':'Off')+'</span></div>'+
       '<div>Frame <span>#'+d.frame+'</span> &nbsp; Last: <span>'+d.last_sent+'</span></div>';
   }catch(e){
     document.getElementById('box').innerHTML='<span class="err">Cannot reach server</span>';
@@ -703,6 +894,7 @@ async function apply(){
         interval:parseInt(document.getElementById('interval').value),
         brightness:parseFloat(document.getElementById('brightness').value),
         radar_opacity:parseFloat(document.getElementById('radar_opacity').value),
+        alert_polygons:document.getElementById('alert_polygons').checked,
       })
     });
     const d=await r.json();
@@ -762,6 +954,8 @@ def make_handler(state: RadarState, trigger: threading.Event):
             interval      = int(data["interval"])       if "interval"      in data else None
             brightness    = float(data["brightness"])   if "brightness"    in data else None
             radar_opacity = float(data["radar_opacity"]) if "radar_opacity" in data else None
+            alert_polygons = (bool(data["alert_polygons"])
+                              if "alert_polygons" in data else None)
 
             if zoom is not None and not (5 <= zoom <= 12):
                 self._send_json(400, {"ok": False, "error": "zoom must be 5-12"})
@@ -781,7 +975,9 @@ def make_handler(state: RadarState, trigger: threading.Event):
 
             err = state.update(zipcode=zipcode, zoom=zoom,
                                rotation=rotation, interval=interval,
-                               brightness=brightness, radar_opacity=radar_opacity)
+                               brightness=brightness,
+                               radar_opacity=radar_opacity,
+                               alert_polygons=alert_polygons)
             if err:
                 self._send_json(400, {"ok": False, "error": err})
                 return
@@ -802,10 +998,20 @@ def main():
     )
     parser.add_argument("--zip",      required=True,
                         help="Initial US ZIP code")
-    parser.add_argument("--host",     required=True,
-                        help="ESP32 IP address")
+    parser.add_argument("--host",
+                        help="ESP32 IP address for direct TCP mode")
     parser.add_argument("--port",     type=int, default=TCP_PORT,
                         help=f"ESP32 TCP port (default: {TCP_PORT})")
+    parser.add_argument("--channel-server",
+                        help="channel_server host; enables channel image transfer mode")
+    parser.add_argument("--channel-port", type=int, default=9000,
+                        help="channel_server TCP port (default: 9000)")
+    parser.add_argument("--channel", default="radar",
+                        help="display channel for image transfer mode (default: radar)")
+    parser.add_argument("--control-channel", default="tft/control",
+                        help="control channel to publish the channel list (default: tft/control)")
+    parser.add_argument("--no-control", action="store_true",
+                        help="do not publish the control channel list in channel mode")
     parser.add_argument("--interval", type=int, default=300,
                         help="Initial update interval in seconds (default: 300)")
     parser.add_argument("--zoom",     type=int, default=8,
@@ -819,9 +1025,14 @@ def main():
     parser.add_argument("--radar-opacity", type=float, default=1.0,
                         dest="radar_opacity",
                         help="Radar overlay opacity 0.0-1.0 (default: 1.0)")
+    parser.add_argument("--alert-polygons", action="store_true",
+                        help="Start with NWS alert polygon outlines enabled")
     parser.add_argument("--webport",  type=int, default=8080,
                         help="Web UI port (default: 8080)")
     args = parser.parse_args()
+
+    if not args.channel_server and not args.host:
+        sys.exit("Either --host for direct TCP mode or --channel-server for channel mode is required")
 
     # Resolve initial ZIP
     print(f"Resolving ZIP {args.zip} ...")
@@ -835,13 +1046,21 @@ def main():
     state   = RadarState(args.zip, args.zoom, args.rotation,
                          args.interval, lat, lon,
                          brightness=args.brightness,
-                         radar_opacity=args.radar_opacity)
+                         radar_opacity=args.radar_opacity,
+                         alert_polygons=args.alert_polygons)
     trigger = threading.Event()
+
+    if args.channel_server and not args.no_control:
+        print(f"Publishing control channel list: [{args.channel!r}]")
+        publish_control_channels(args.channel_server, args.channel_port,
+                                 args.control_channel, [args.channel])
+        time.sleep(0.35)
 
     # Radar worker (daemon so it dies when main exits)
     threading.Thread(
         target=radar_worker,
-        args=(state, args.host, args.port, trigger),
+        args=(state, args.host, args.port, trigger,
+              args.channel_server, args.channel_port, args.channel),
         daemon=True,
     ).start()
 
@@ -862,7 +1081,10 @@ def main():
         lan_ip = "localhost"
     print(f"\nWeb UI (this machine) : http://localhost:{args.webport}")
     print(f"Web UI (network)      : http://{lan_ip}:{args.webport}")
-    print(f"ESP32  : {args.host}:{args.port}")
+    if args.channel_server:
+        print(f"Channel image mode : {args.channel_server}:{args.channel_port}/{args.channel}")
+    else:
+        print(f"ESP32  : {args.host}:{args.port}")
     print(f"ZIP={args.zip}  zoom={args.zoom}  "
           f"rotation={args.rotation}  interval={args.interval}s")
     print("Ctrl+C to exit\n")
