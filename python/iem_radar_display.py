@@ -2,8 +2,9 @@
 """
 iem_radar_display.py
 
-Fetches a live NEXRAD radar image centred on a ZIP code from the Iowa
-Environmental Mesonet (IEM) and sends it to the ESP32 TFT display over TCP.
+Fetches a live NEXRAD radar image centered on a ZIP code, lat/lon pair, or
+SAME/NWS county or zone code from the Iowa Environmental Mesonet (IEM) and sends
+it to the ESP32 TFT display over TCP.
 Repeats at a configurable interval.
 
 Radar source : IEM NEXRAD N0Q CONUS Composite WMS
@@ -19,6 +20,8 @@ Display      : raw RGB565 via the RGB! TCP protocol
 
 Usage:
     python iem_radar_display.py --zip 27587 --host 192.168.1.42
+    python iem_radar_display.py --lat 35.9799 --lon -78.5097 --host 192.168.1.42
+    python iem_radar_display.py --county NCC183 --host 192.168.1.42
     python iem_radar_display.py --zip 27587 --host 192.168.1.42 --rotation 1
     python iem_radar_display.py --zip 27587 --host 192.168.1.42 --zoom 9 --webport 8080
 
@@ -37,6 +40,7 @@ import argparse
 import io
 import json
 import math
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -60,7 +64,9 @@ except ImportError:
 DISPLAY_W = 320
 DISPLAY_H = 480
 TCP_PORT  = 5555
+API_PORT  = 8765
 MAGIC     = b"RGB!"
+INFO_BANNER_H = 24
 
 # ── Map sources ───────────────────────────────────────────────────────────────
 OSM_HOST  = "https://tile.openstreetmap.org"
@@ -75,20 +81,36 @@ IEM_LAYER = "nexrad-n0q-900913"   # the single composite layer this CGI exposes
 # Nominatim ZIP → lat/lon
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
-# NWS active alerts GeoJSON.  Alert geometries are drawn as outlines on the
-# radar map when enabled.
+# NWS active alerts GeoJSON. Alert geometries are drawn on the radar map when
+# enabled.
 NWS_ALERTS = "https://api.weather.gov/alerts/active"
+NWS_ZONES = "https://api.weather.gov/zones"
+NWS_ALERT_POLL_SECONDS = 60
+NWS_ALERT_FILL_OPACITY = 0.25
 NWS_ALERT_COLORS = {
-    "statement": (40, 110, 235),
-    "advisory":  (42, 170, 84),
-    "watch":     (245, 214, 55),
-    "warning":   (225, 38, 38),
+    "statement":       (40, 110, 235),
+    "warning":         (225, 38, 38),
+    "tornado_warning": (245, 130, 32),
 }
 NWS_ALERT_PRIORITY = {
-    "statement": 1,
-    "advisory":  2,
-    "watch":     3,
-    "warning":   4,
+    "statement":       1,
+    "warning":         2,
+    "tornado_warning": 3,
+}
+
+STATE_BY_FIPS = {
+    "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA",
+    "08": "CO", "09": "CT", "10": "DE", "11": "DC", "12": "FL",
+    "13": "GA", "15": "HI", "16": "ID", "17": "IL", "18": "IN",
+    "19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME",
+    "24": "MD", "25": "MA", "26": "MI", "27": "MN", "28": "MS",
+    "29": "MO", "30": "MT", "31": "NE", "32": "NV", "33": "NH",
+    "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
+    "39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI",
+    "45": "SC", "46": "SD", "47": "TN", "48": "TX", "49": "UT",
+    "50": "VT", "51": "VA", "53": "WA", "54": "WV", "55": "WI",
+    "56": "WY", "60": "AS", "66": "GU", "69": "MP", "72": "PR",
+    "78": "VI",
 }
 
 # ── Shared HTTP session ───────────────────────────────────────────────────────
@@ -113,6 +135,88 @@ def zip_to_latlon(zipcode: str) -> tuple[float, float]:
     if not data:
         raise ValueError(f"ZIP {zipcode!r} not found")
     return float(data[0]["lat"]), float(data[0]["lon"])
+
+
+def nws_code_to_zone(code: str) -> tuple[str, str]:
+    """Return (zone_type, zone_id) from a 6-digit SAME or NWS zone code."""
+    normalized = code.strip().upper()
+    if re.fullmatch(r"\d{6}", normalized):
+        state = STATE_BY_FIPS.get(normalized[1:3])
+        if not state:
+            raise ValueError(f"unknown SAME state FIPS {normalized[1:3]!r}")
+        return "county", f"{state}C{normalized[3:]}"
+    if re.fullmatch(r"[A-Z]{2}C\d{3}", normalized):
+        return "county", normalized
+    if re.fullmatch(r"[A-Z]{2}Z\d{3}", normalized):
+        return "forecast", normalized
+    raise ValueError(
+        "use a 6-digit SAME code like 037183, an NWS county code like NCC183, "
+        "or a forecast zone like NCZ183"
+    )
+
+
+def exterior_rings(geometry: dict) -> list[list[list[float]]]:
+    gtype = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if gtype == "Polygon" and isinstance(coordinates, list) and coordinates:
+        return [coordinates[0]]
+    if gtype == "MultiPolygon" and isinstance(coordinates, list):
+        return [polygon[0] for polygon in coordinates if polygon]
+    raise RuntimeError(f"unsupported NWS zone geometry type {gtype!r}")
+
+
+def polygon_centroid(ring: list[list[float]]) -> tuple[float, float, float]:
+    if ring[0] != ring[-1]:
+        ring = [*ring, ring[0]]
+
+    area = 0.0
+    cx = 0.0
+    cy = 0.0
+    for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
+        cross = x1 * y2 - x2 * y1
+        area += cross
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+
+    area *= 0.5
+    if abs(area) < 1e-12:
+        raise RuntimeError("NWS zone geometry has zero polygon area")
+    return cx / (6.0 * area), cy / (6.0 * area), abs(area)
+
+
+def geometry_center(geometry: dict) -> tuple[float, float]:
+    total_area = 0.0
+    weighted_lon = 0.0
+    weighted_lat = 0.0
+    for ring in exterior_rings(geometry):
+        lon, lat, area = polygon_centroid(ring)
+        weighted_lon += lon * area
+        weighted_lat += lat * area
+        total_area += area
+    if total_area <= 0.0:
+        raise RuntimeError("NWS zone geometry did not contain polygon area")
+    return weighted_lat / total_area, weighted_lon / total_area
+
+
+def nws_code_to_latlon(code: str) -> tuple[float, float, str]:
+    """Return (lat, lon, normalized zone id) for a SAME/NWS county or zone code."""
+    zone_type, zone_id = nws_code_to_zone(code)
+    r = _session.get(f"{NWS_ZONES}/{zone_type}/{zone_id}", timeout=10)
+    r.raise_for_status()
+    payload = r.json()
+    geometry = payload.get("geometry")
+    if not geometry:
+        raise RuntimeError(f"NWS API returned no geometry for {zone_id}")
+    lat, lon = geometry_center(geometry)
+    validate_latlon(lat, lon)
+    return lat, lon, zone_id
+
+
+def validate_latlon(lat: float, lon: float) -> None:
+    if not (-85.0 <= lat <= 85.0):
+        raise ValueError("lat must be between -85 and 85")
+    if not (-180.0 <= lon <= 180.0):
+        raise ValueError("lon must be between -180 and 180")
 
 
 def deg2tile(lat: float, lon: float, z: int) -> tuple[int, int]:
@@ -155,6 +259,37 @@ def crop_bbox_latlon(z: int, tx0: int, ty0: int,
     max_lat = px_to_lat(crop_top)           # y increases downward
     min_lat = px_to_lat(crop_top + crop_h)
     return min_lat, min_lon, max_lat, max_lon
+
+
+def map_view_for_center(lat: float, lon: float, zoom: int,
+                        width: int, height: int) -> dict:
+    """Return tile/crop metadata for the display crop centered on lat/lon."""
+    cx_tile, cy_tile = deg2tile(lat, lon, zoom)
+    tiles_x = math.ceil(width / TILE_SIZE) + 2
+    tiles_y = math.ceil(height / TILE_SIZE) + 2
+    tx0 = cx_tile - tiles_x // 2
+    ty0 = cy_tile - tiles_y // 2
+    canvas_w = tiles_x * TILE_SIZE
+    canvas_h = tiles_y * TILE_SIZE
+
+    px, py = latlon_to_canvas_px(lat, lon, zoom, tx0, ty0)
+    crop_left = int(px) - width // 2
+    crop_top = int(py) - height // 2
+    crop_left = max(0, min(crop_left, canvas_w - width))
+    crop_top = max(0, min(crop_top, canvas_h - height))
+
+    min_lat, min_lon, max_lat, max_lon = crop_bbox_latlon(
+        zoom, tx0, ty0, crop_left, crop_top, width, height)
+
+    return {
+        "tiles_x": tiles_x,
+        "tiles_y": tiles_y,
+        "tx0": tx0,
+        "ty0": ty0,
+        "crop_left": crop_left,
+        "crop_top": crop_top,
+        "bbox": (min_lat, min_lon, max_lat, max_lon),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,14 +367,12 @@ def fetch_iem_radar(min_lat: float, min_lon: float,
 
 def classify_nws_alert(event: str) -> str | None:
     event = event.lower()
+    if "tornado warning" in event:
+        return "tornado_warning"
     if "warning" in event:
         return "warning"
-    if "watch" in event:
-        return "watch"
     if "statement" in event:
         return "statement"
-    if "advisory" in event:
-        return "advisory"
     return None
 
 
@@ -247,12 +380,12 @@ def iter_geojson_rings(geometry: dict):
     geom_type = geometry.get("type")
     coords = geometry.get("coordinates", [])
     if geom_type == "Polygon":
-        for ring in coords:
-            yield ring
+        if coords:
+            yield coords[0]
     elif geom_type == "MultiPolygon":
         for polygon in coords:
-            for ring in polygon:
-                yield ring
+            if polygon:
+                yield polygon[0]
 
 
 def ring_intersects_bbox(ring, min_lat: float, min_lon: float,
@@ -267,6 +400,119 @@ def ring_intersects_bbox(ring, min_lat: float, min_lon: float,
         max(lons) < min_lon or min(lons) > max_lon or
         max(lats) < min_lat or min(lats) > max_lat
     )
+
+
+def _ccw(a: tuple[int, int], b: tuple[int, int],
+         c: tuple[int, int]) -> bool:
+    return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segments_intersect(a: tuple[int, int], b: tuple[int, int],
+                        c: tuple[int, int], d: tuple[int, int]) -> bool:
+    return _ccw(a, c, d) != _ccw(b, c, d) and _ccw(a, b, c) != _ccw(a, b, d)
+
+
+def _point_in_polygon(point: tuple[int, int],
+                      polygon: list[tuple[int, int]]) -> bool:
+    x, y = point
+    inside = False
+    j = len(polygon) - 1
+    for i in range(len(polygon)):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y) and
+                x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def projected_ring_visible(points: list[tuple[int, int]],
+                           width: int, height: int) -> bool:
+    if len(points) < 2:
+        return False
+
+    min_x = min(x for x, _y in points)
+    max_x = max(x for x, _y in points)
+    min_y = min(y for _x, y in points)
+    max_y = max(y for _x, y in points)
+    if max_x < 0 or min_x >= width or max_y < 0 or min_y >= height:
+        return False
+
+    if any(0 <= x < width and 0 <= y < height for x, y in points):
+        return True
+
+    rect_edges = [
+        ((0, 0), (width - 1, 0)),
+        ((width - 1, 0), (width - 1, height - 1)),
+        ((width - 1, height - 1), (0, height - 1)),
+        ((0, height - 1), (0, 0)),
+    ]
+    closed = points + [points[0]]
+    for a, b in zip(closed, closed[1:]):
+        for c, d in rect_edges:
+            if _segments_intersect(a, b, c, d):
+                return True
+
+    return len(points) >= 3 and _point_in_polygon((width // 2, height // 2),
+                                                  points)
+
+
+def normalize_projected_ring(points: list[tuple[int, int]]
+                             ) -> tuple[tuple[int, int], ...]:
+    cleaned = []
+    for point in points:
+        if not cleaned or cleaned[-1] != point:
+            cleaned.append(point)
+    if len(cleaned) > 1 and cleaned[0] == cleaned[-1]:
+        cleaned.pop()
+    if not cleaned:
+        return tuple()
+
+    def rotations(seq):
+        for idx in range(len(seq)):
+            yield tuple(seq[idx:] + seq[:idx])
+
+    forward = min(rotations(cleaned))
+    reverse = min(rotations(list(reversed(cleaned))))
+    return min(forward, reverse)
+
+
+def count_mask_regions(mask: Image.Image, min_pixels: int = 1) -> int:
+    """Count connected visible regions in a 1-bit-ish rendered alert mask."""
+    mask = mask.convert("L")
+    width, height = mask.size
+    pixels = mask.load()
+    seen = bytearray(width * height)
+    regions = 0
+
+    for start_y in range(height):
+        row_offset = start_y * width
+        for start_x in range(width):
+            idx = row_offset + start_x
+            if seen[idx] or pixels[start_x, start_y] == 0:
+                continue
+
+            regions += 1
+            seen[idx] = 1
+            stack = [(start_x, start_y)]
+            region_pixels = 0
+
+            while stack:
+                x, y = stack.pop()
+                region_pixels += 1
+                for ny in range(max(0, y - 1), min(height, y + 2)):
+                    nrow = ny * width
+                    for nx in range(max(0, x - 1), min(width, x + 2)):
+                        nidx = nrow + nx
+                        if not seen[nidx] and pixels[nx, ny] != 0:
+                            seen[nidx] = 1
+                            stack.append((nx, ny))
+
+            if region_pixels < min_pixels:
+                regions -= 1
+
+    return regions
 
 
 def fetch_nws_alert_polygons(min_lat: float, min_lon: float,
@@ -287,18 +533,70 @@ def fetch_nws_alert_polygons(min_lat: float, min_lon: float,
             if ring_intersects_bbox(ring, min_lat, min_lon, max_lat, max_lon)
         ]
         if rings:
-            alerts.append({"level": level, "rings": rings})
+            alerts.append({
+                "id": feature.get("id") or props.get("id", ""),
+                "event": props.get("event", ""),
+                "level": level,
+                "updated": props.get("updated", ""),
+                "effective": props.get("effective", ""),
+                "expires": props.get("expires", ""),
+                "ends": props.get("ends", ""),
+                "status": props.get("status", ""),
+                "messageType": props.get("messageType", ""),
+                "severity": props.get("severity", ""),
+                "certainty": props.get("certainty", ""),
+                "urgency": props.get("urgency", ""),
+                "rings": rings,
+            })
 
     alerts.sort(key=lambda item: NWS_ALERT_PRIORITY[item["level"]])
     return alerts
 
 
-def draw_nws_alert_polygons(draw: ImageDraw.ImageDraw, alerts: list[dict],
+def nws_alert_signature(alerts: list[dict]) -> str:
+    """Stable signature for visible NWS alert identity, timing, and geometry."""
+    items = []
+    for alert in alerts:
+        rings = []
+        for ring in alert["rings"]:
+            rings.append([
+                [round(float(lon), 4), round(float(lat), 4)]
+                for lon, lat, *_ in ring
+            ])
+        items.append({
+            "id": alert.get("id", ""),
+            "event": alert.get("event", ""),
+            "level": alert.get("level", ""),
+            "updated": alert.get("updated", ""),
+            "effective": alert.get("effective", ""),
+            "expires": alert.get("expires", ""),
+            "ends": alert.get("ends", ""),
+            "status": alert.get("status", ""),
+            "messageType": alert.get("messageType", ""),
+            "severity": alert.get("severity", ""),
+            "certainty": alert.get("certainty", ""),
+            "urgency": alert.get("urgency", ""),
+            "rings": rings,
+        })
+    items.sort(key=lambda item: (
+        item["level"], item["id"], item["event"], item["updated"],
+        json.dumps(item["rings"], separators=(",", ":")),
+    ))
+    return json.dumps(items, sort_keys=True, separators=(",", ":"))
+
+
+def draw_nws_alert_polygons(img: Image.Image, draw: ImageDraw.ImageDraw,
+                            alerts: list[dict],
                             zoom: int, tx0: int, ty0: int,
                             crop_left: int, crop_top: int,
-                            width: int, height: int) -> int:
+                            width: int, height: int,
+                            fill_opacity: float = NWS_ALERT_FILL_OPACITY) -> int:
     drawn = 0
     line_w = 2 if min(width, height) <= 320 else 3
+    fill_opacity = max(0.0, min(1.0, fill_opacity))
+    fill_alpha = round(fill_opacity * 255)
+    projected_rings = {}
+
     for alert in alerts:
         color = NWS_ALERT_COLORS[alert["level"]]
         for ring in alert["rings"]:
@@ -306,9 +604,38 @@ def draw_nws_alert_polygons(draw: ImageDraw.ImageDraw, alerts: list[dict],
             for lon, lat, *_ in ring:
                 x, y = latlon_to_canvas_px(lat, lon, zoom, tx0, ty0)
                 points.append((round(x - crop_left), round(y - crop_top)))
-            if len(points) >= 2:
-                draw.line(points + [points[0]], fill=color, width=line_w)
-                drawn += 1
+            if not projected_ring_visible(points, width, height):
+                continue
+            key = normalize_projected_ring(points)
+            if len(key) >= 2:
+                projected_rings[key] = (color, list(key))
+
+    count_layer = Image.new("L", (width, height), 0)
+    count_draw = ImageDraw.Draw(count_layer)
+    for _color, points in projected_rings.values():
+        if fill_alpha > 0 and len(points) >= 3:
+            count_draw.polygon(points, fill=255)
+        elif fill_alpha == 0:
+            count_draw.line(points + [points[0]], fill=255, width=line_w)
+
+    count_height = max(1, height - INFO_BANNER_H)
+    count_mask = count_layer.crop((0, 0, width, count_height))
+    min_region_pixels = max(25, (width * count_height) // 2000)
+    drawn = count_mask_regions(count_mask, min_region_pixels)
+
+    if fill_alpha > 0:
+        fill_layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        fill_draw = ImageDraw.Draw(fill_layer)
+        for color, points in projected_rings.values():
+            if len(points) >= 3:
+                fill_draw.polygon(points, fill=(*color, fill_alpha))
+        filled = Image.alpha_composite(img.convert("RGBA"), fill_layer)
+        img.paste(filled.convert("RGB"))
+        draw = ImageDraw.Draw(img)
+
+    for color, points in projected_rings.values():
+        draw.line(points + [points[0]], fill=color, width=line_w)
+
     return drawn
 
 
@@ -320,24 +647,23 @@ def build_radar_image(lat: float, lon: float, zoom: int,
                       brightness: float = 1.0,
                       radar_opacity: float = 1.0,
                       alert_polygons: bool = False,
+                      alert_fill_opacity: float = NWS_ALERT_FILL_OPACITY,
                       width: int = DISPLAY_W,
                       height: int = DISPLAY_H) -> Image.Image:
     """
     Build a width × height composite:
       1. OSM base map (tiled, any zoom)
       2. IEM NEXRAD N0Q radar overlay (WMS bounding-box, any zoom, no cap)
-      3. Optional NWS warning/watch/statement/advisory polygon outlines
+      3. Optional NWS warning/statement polygon fills/outlines
       4. Yellow crosshair at ZIP centre
       5. Timestamp + source banner
     """
     # ── Tile grid ─────────────────────────────────────────────────────────
-    cx_tile, cy_tile = deg2tile(lat, lon, zoom)
-    tiles_x = math.ceil(width / TILE_SIZE) + 2
-    tiles_y = math.ceil(height / TILE_SIZE) + 2
-    tx0 = cx_tile - tiles_x // 2
-    ty0 = cy_tile - tiles_y // 2
-    canvas_w = tiles_x * TILE_SIZE
-    canvas_h = tiles_y * TILE_SIZE
+    view = map_view_for_center(lat, lon, zoom, width, height)
+    tiles_x = view["tiles_x"]
+    tiles_y = view["tiles_y"]
+    tx0 = view["tx0"]
+    ty0 = view["ty0"]
 
     print(f"  OSM grid {tiles_x}×{tiles_y} tiles at zoom {zoom}")
 
@@ -345,15 +671,11 @@ def build_radar_image(lat: float, lon: float, zoom: int,
     base = build_osm_canvas(zoom, tx0, ty0, tiles_x, tiles_y)
 
     # ── Crop window centred on ZIP ────────────────────────────────────────
-    px, py = latlon_to_canvas_px(lat, lon, zoom, tx0, ty0)
-    crop_left = int(px) - width // 2
-    crop_top  = int(py) - height // 2
-    crop_left = max(0, min(crop_left, canvas_w - width))
-    crop_top  = max(0, min(crop_top,  canvas_h - height))
+    crop_left = view["crop_left"]
+    crop_top = view["crop_top"]
 
     # ── 2. IEM radar overlay ──────────────────────────────────────────────
-    min_lat, min_lon, max_lat, max_lon = crop_bbox_latlon(
-        zoom, tx0, ty0, crop_left, crop_top, width, height)
+    min_lat, min_lon, max_lat, max_lon = view["bbox"]
 
     print(f"  BBOX: {min_lat:.4f},{min_lon:.4f} → {max_lat:.4f},{max_lon:.4f}")
     print(f"  Fetching IEM NEXRAD N0Q …", end=" ", flush=True)
@@ -386,7 +708,7 @@ def build_radar_image(lat: float, lon: float, zoom: int,
         if brightness != 1.0:
             img = ImageEnhance.Brightness(img).enhance(brightness)
 
-    # ── 3. NWS alert polygon outlines ─────────────────────────────────────
+    # ── 3. NWS alert polygon fills/outlines ───────────────────────────────
     draw = ImageDraw.Draw(img)
     alert_count = 0
     if alert_polygons:
@@ -394,12 +716,14 @@ def build_radar_image(lat: float, lon: float, zoom: int,
         try:
             alerts = fetch_nws_alert_polygons(min_lat, min_lon, max_lat, max_lon)
             alert_count = draw_nws_alert_polygons(
-                draw, alerts, zoom, tx0, ty0, crop_left, crop_top, width, height)
-            print(f"{alert_count} outline(s)")
+                img, draw, alerts, zoom, tx0, ty0, crop_left, crop_top,
+                width, height, alert_fill_opacity)
+            print(f"{alert_count} polygon(s)")
         except Exception as e:
             print(f"failed: {e}")
 
     # ── 4. Crosshair ──────────────────────────────────────────────────────
+    draw = ImageDraw.Draw(img)
     cx, cy = width // 2, height // 2
     arm = 12
     draw.line([(cx - arm, cy), (cx + arm, cy)], fill=(255, 255, 0), width=2)
@@ -408,7 +732,7 @@ def build_radar_image(lat: float, lon: float, zoom: int,
                  outline=(255, 255, 0), width=1)
 
     # ── 5. Info banner ─────────────────────────────────────────────────────
-    banner_h = 24
+    banner_h = INFO_BANNER_H
     banner = Image.new("RGBA", (width, banner_h), (0, 0, 0, 190))
     img_rgba = img.convert("RGBA")
     img_rgba.alpha_composite(banner, dest=(0, height - banner_h))
@@ -593,9 +917,13 @@ def publish_control_channels(host: str, port: int, control_channel: str,
 
 class RadarState:
     def __init__(self, zipcode, zoom, rotation, interval, lat, lon,
-                 brightness=1.0, radar_opacity=1.0, alert_polygons=False):
+                 county_code="",
+                 brightness=1.0, radar_opacity=1.0, alert_polygons=False,
+                 alert_fill_opacity=NWS_ALERT_FILL_OPACITY):
         self._lock        = threading.Lock()
         self.zipcode      = zipcode
+        self.county_code  = county_code
+        self.center_mode  = "county" if county_code else ("zip" if zipcode else "latlon")
         self.zoom         = zoom
         self.rotation     = rotation   # 0=portrait 1=landscape 2=180 3=270
         self.interval     = interval
@@ -604,36 +932,66 @@ class RadarState:
         self.brightness   = brightness    # 0.5–2.0, 1.0 = no change
         self.radar_opacity = radar_opacity # 0.0–1.0, 1.0 = fully opaque
         self.alert_polygons = alert_polygons
+        self.alert_fill_opacity = alert_fill_opacity
         self.status       = "Starting..."
         self.last_sent    = None
         self.frame        = 0
 
     def get(self):
         with self._lock:
-            return (self.zipcode, self.zoom, self.rotation,
+            return (self.zipcode, self.county_code, self.center_mode,
+                    self.zoom, self.rotation,
                     self.interval, self.lat, self.lon,
                     self.brightness, self.radar_opacity,
-                    self.alert_polygons)
+                    self.alert_polygons, self.alert_fill_opacity)
 
     def update(self, zipcode=None, zoom=None, rotation=None, interval=None,
-               brightness=None, radar_opacity=None, alert_polygons=None):
+               lat=None, lon=None, county_code=None,
+               brightness=None, radar_opacity=None,
+               alert_polygons=None, alert_fill_opacity=None):
         """Update one or more fields.  Re-resolves ZIP if it changed.
         Returns an error string on failure, or None on success."""
         with self._lock:
-            if zipcode and zipcode != self.zipcode:
+            if zipcode:
                 try:
                     lat, lon = zip_to_latlon(zipcode)
                 except Exception as e:
                     return str(e)
                 self.zipcode = zipcode
+                self.county_code = ""
+                self.center_mode = "zip"
                 self.lat     = lat
                 self.lon     = lon
+            elif county_code:
+                try:
+                    lat, lon, zone_id = nws_code_to_latlon(county_code)
+                except Exception as e:
+                    return str(e)
+                self.zipcode = ""
+                self.county_code = zone_id
+                self.center_mode = "county"
+                self.lat = lat
+                self.lon = lon
+            elif lat is not None or lon is not None:
+                if lat is None or lon is None:
+                    return "lat and lon must be provided together"
+                try:
+                    validate_latlon(lat, lon)
+                except Exception as e:
+                    return str(e)
+                self.zipcode = ""
+                self.county_code = ""
+                self.center_mode = "latlon"
+                self.lat = lat
+                self.lon = lon
             if zoom          is not None: self.zoom          = zoom
             if rotation      is not None: self.rotation      = rotation
             if interval      is not None: self.interval      = interval
             if brightness    is not None: self.brightness    = brightness
             if radar_opacity is not None: self.radar_opacity = radar_opacity
             if alert_polygons is not None: self.alert_polygons = alert_polygons
+            if alert_fill_opacity is not None:
+                self.alert_fill_opacity = alert_fill_opacity
         return None
 
     def set_status(self, msg):
@@ -644,12 +1002,15 @@ class RadarState:
         with self._lock:
             return {
                 "zipcode":      self.zipcode,
+                "county_code":  self.county_code,
+                "center_mode":  self.center_mode,
                 "zoom":         self.zoom,
                 "rotation":     self.rotation,
                 "interval":     self.interval,
                 "brightness":   round(self.brightness, 2),
                 "radar_opacity": round(self.radar_opacity, 2),
                 "alert_polygons": self.alert_polygons,
+                "alert_fill_opacity": round(self.alert_fill_opacity, 2),
                 "lat":          round(self.lat, 4),
                 "lon":          round(self.lon, 4),
                 "status":       self.status,
@@ -668,15 +1029,23 @@ def radar_worker(state: RadarState, esp_host: str | None, esp_port: int,
                  channel_port: int = 9000, channel_name: str = "radar"):
     """Runs forever.  Wakes on trigger (immediate update) or interval timeout."""
     while True:
-        (zipcode, zoom, rotation, interval, lat, lon, brightness,
-         radar_opacity, alert_polygons) = state.get()
+        (zipcode, county_code, center_mode, zoom, rotation, interval,
+         lat, lon, brightness, radar_opacity, alert_polygons,
+         alert_fill_opacity) = state.get()
 
         state.set_status("Fetching radar...")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n-- Frame {state.frame + 1}  {ts} --")
-        print(f"   ZIP={zipcode}  zoom={zoom}  rotation={rotation}  "
+        if center_mode == "zip":
+            center_label = zipcode
+        elif center_mode == "county":
+            center_label = county_code
+        else:
+            center_label = f"{lat:.4f},{lon:.4f}"
+        print(f"   Center={center_label}  zoom={zoom}  rotation={rotation}  "
               f"bright={brightness:.2f}  opacity={radar_opacity:.2f}  "
-              f"alerts={'on' if alert_polygons else 'off'}")
+              f"alerts={'on' if alert_polygons else 'off'}  "
+              f"alert_fill={alert_fill_opacity:.2f}")
 
         try:
             source_w, source_h = source_size_for_rotation(rotation)
@@ -684,6 +1053,7 @@ def radar_worker(state: RadarState, esp_host: str | None, esp_port: int,
                                     brightness=brightness,
                                     radar_opacity=radar_opacity,
                                     alert_polygons=alert_polygons,
+                                    alert_fill_opacity=alert_fill_opacity,
                                     width=source_w,
                                     height=source_h)
             img = rotate_image_pixels(img, rotation)
@@ -713,6 +1083,47 @@ def radar_worker(state: RadarState, esp_host: str | None, esp_port: int,
         trigger.clear()
 
 
+def nws_alert_worker(state: RadarState, trigger: threading.Event,
+                     poll_seconds: int = NWS_ALERT_POLL_SECONDS):
+    """
+    Poll visible NWS alerts while overlays are enabled.
+
+    The first successful poll establishes a baseline.  Later changes wake the
+    radar worker so the TFT redraws without waiting for the normal radar
+    interval.
+    """
+    last_signature = None
+    while True:
+        try:
+            (_zipcode, _county_code, _center_mode, zoom, rotation, _interval,
+             lat, lon, _brightness, _radar_opacity, alert_polygons,
+             _alert_fill_opacity) = state.get()
+
+            if not alert_polygons:
+                last_signature = None
+                time.sleep(poll_seconds)
+                continue
+
+            source_w, source_h = source_size_for_rotation(rotation)
+            view = map_view_for_center(lat, lon, zoom, source_w, source_h)
+            min_lat, min_lon, max_lat, max_lon = view["bbox"]
+            alerts = fetch_nws_alert_polygons(min_lat, min_lon, max_lat, max_lon)
+            signature = nws_alert_signature(alerts)
+
+            if last_signature is None:
+                last_signature = signature
+                print(f"   NWS alert watcher baseline: {len(alerts)} visible")
+            elif signature != last_signature:
+                last_signature = signature
+                print(f"   NWS visible alert change detected: "
+                      f"{len(alerts)} visible; updating display")
+                trigger.set()
+        except Exception as e:
+            print(f"   NWS alert watcher failed: {e}")
+
+        time.sleep(poll_seconds)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Web UI  (served by a background thread on --webport)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -734,6 +1145,7 @@ h1{font-size:1.4rem;font-weight:700;color:#38bdf8;margin-bottom:4px}
 .sub{font-size:.8rem;color:#94a3b8;margin-bottom:24px}
 label{display:block;font-size:.75rem;font-weight:600;color:#94a3b8;
       margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em}
+.hint{font-size:.78rem;color:#94a3b8;margin:-12px 0 18px;line-height:1.4}
 input[type=text],input[type=number],select{
       width:100%;padding:10px 14px;border-radius:8px;
       border:1px solid #334155;background:#0f172a;color:#e2e8f0;
@@ -774,16 +1186,44 @@ button:disabled{background:#334155;cursor:not-allowed}
 </head>
 <body>
 <div class="card">
-  <h1>&#127929; ESP32 Radar Display</h1>
-  <p class="sub">IEM NEXRAD N0Q &mdash; changes update the display immediately</p>
+  <h1>&#128225; ESP32 Radar Display</h1>
+  <p class="sub">Center by ZIP, lat/lon, or SAME/NWS county code</p>
 
-  <label for="zip">ZIP Code</label>
-  <input id="zip" type="text" maxlength="5" pattern="[0-9]{5}" placeholder="e.g. 27587">
+  <label for="center_mode">Map Center</label>
+  <select id="center_mode" onchange="markDirty('center_mode');toggleCenterFields()">
+    <option value="zip">ZIP Code</option>
+    <option value="county">NWS County / SAME</option>
+    <option value="latlon">Latitude / Longitude</option>
+  </select>
+
+  <div id="zipFields">
+    <label for="zip">ZIP Code</label>
+    <input id="zip" type="text" maxlength="5" pattern="[0-9]{5}" placeholder="e.g. 27587" oninput="markDirty('zip')">
+    <p class="hint">US 5-digit ZIP code.</p>
+  </div>
+
+  <div id="countyFields">
+    <label for="county_code">SAME / NWS County or Zone Code</label>
+    <input id="county_code" type="text" maxlength="6" placeholder="e.g. 037183, NCC183, NCZ183" oninput="markDirty('county_code')">
+    <p class="hint">Accepts 6-digit SAME, county codes like NCC183, or zone codes like NCZ183.</p>
+  </div>
+
+  <div class="row" id="latlonFields">
+    <div>
+      <label for="lat">Latitude</label>
+      <input id="lat" type="number" min="-85" max="85" step="0.0001" placeholder="35.9799" oninput="markDirty('lat')">
+    </div>
+    <div>
+      <label for="lon">Longitude</label>
+      <input id="lon" type="number" min="-180" max="180" step="0.0001" placeholder="-78.5097" oninput="markDirty('lon')">
+    </div>
+  </div>
+  <p class="hint" id="latlonHint">Decimal degrees. Use negative longitude for locations west of Greenwich.</p>
 
   <div class="row">
     <div>
       <label for="zoom">Zoom</label>
-      <select id="zoom">
+      <select id="zoom" onchange="markDirty('zoom')">
         <option value="5">5 ~ 500 km</option>
         <option value="6">6 ~ 250 km</option>
         <option value="7">7 ~ 125 km</option>
@@ -796,7 +1236,7 @@ button:disabled{background:#334155;cursor:not-allowed}
     </div>
     <div>
       <label for="rotation">Rotation</label>
-      <select id="rotation">
+      <select id="rotation" onchange="markDirty('rotation')">
         <option value="0">0&deg; Portrait</option>
         <option value="1">90&deg; Landscape</option>
         <option value="2">180&deg; Inv. Portrait</option>
@@ -806,7 +1246,7 @@ button:disabled{background:#334155;cursor:not-allowed}
   </div>
 
   <label for="interval">Update Interval (seconds)</label>
-  <input id="interval" type="number" min="30" max="3600" step="30">
+  <input id="interval" type="number" min="30" max="3600" step="30" oninput="markDirty('interval')">
 
   <div class="srow">
     <div class="shdr">
@@ -814,7 +1254,7 @@ button:disabled{background:#334155;cursor:not-allowed}
       <span class="sval" id="brightVal">1.00</span>
     </div>
     <input type="range" id="brightness" min="0.25" max="2.0" step="0.05" value="1.0"
-           oninput="document.getElementById('brightVal').textContent=parseFloat(this.value).toFixed(2)">
+           oninput="markDirty('brightness');document.getElementById('brightVal').textContent=parseFloat(this.value).toFixed(2)">
   </div>
 
   <div class="srow">
@@ -823,12 +1263,21 @@ button:disabled{background:#334155;cursor:not-allowed}
       <span class="sval" id="opacityVal">1.00</span>
     </div>
     <input type="range" id="radar_opacity" min="0.0" max="1.0" step="0.05" value="1.0"
-           oninput="document.getElementById('opacityVal').textContent=parseFloat(this.value).toFixed(2)">
+           oninput="markDirty('radar_opacity');document.getElementById('opacityVal').textContent=parseFloat(this.value).toFixed(2)">
   </div>
 
   <div class="checkrow">
-    <input id="alert_polygons" type="checkbox">
-    <label for="alert_polygons">NWS warning/watch/statement/advisory outlines</label>
+    <input id="alert_polygons" type="checkbox" onchange="markDirty('alert_polygons')">
+    <label for="alert_polygons">NWS warning/statement polygons</label>
+  </div>
+
+  <div class="srow">
+    <div class="shdr">
+      <label for="alert_fill_opacity">NWS Fill Opacity</label>
+      <span class="sval" id="alertFillVal">0.25</span>
+    </div>
+    <input type="range" id="alert_fill_opacity" min="0.0" max="1.0" step="0.05" value="0.25"
+           oninput="markDirty('alert_fill_opacity');document.getElementById('alertFillVal').textContent=parseFloat(this.value).toFixed(2)">
   </div>
 
   <button id="btn" onclick="apply()">&#9654; Apply &amp; Update Display Now</button>
@@ -837,42 +1286,73 @@ button:disabled{background:#334155;cursor:not-allowed}
 </div>
 
 <script>
+const dirtyFields=new Set();
+function markDirty(id){
+  dirtyFields.add(id);
+}
+function isDirty(id){
+  return dirtyFields.has(id);
+}
+function toggleCenterFields(){
+  const mode=document.getElementById('center_mode').value;
+  document.getElementById('zipFields').style.display=(mode==='zip')?'block':'none';
+  document.getElementById('countyFields').style.display=(mode==='county')?'block':'none';
+  document.getElementById('latlonFields').style.display=(mode==='latlon')?'grid':'none';
+  document.getElementById('latlonHint').style.display=(mode==='latlon')?'block':'none';
+}
+function setCenterFromStatus(d){
+  const mode=d.center_mode||'zip';
+  if(!isDirty('center_mode')) document.getElementById('center_mode').value=mode;
+  if(!isDirty('zip')) document.getElementById('zip').value=d.zipcode||'';
+  if(!isDirty('county_code')) document.getElementById('county_code').value=d.county_code||'';
+  if(!isDirty('lat')) document.getElementById('lat').value=d.lat;
+  if(!isDirty('lon')) document.getElementById('lon').value=d.lon;
+  toggleCenterFields();
+}
 async function poll(){
   try{
     const d=await(await fetch('/api/status')).json();
-    const active=document.activeElement;
-    // Only update a field if the user is not currently editing it
     function setVal(id,val){
       const el=document.getElementById(id);
-      if(el&&el!==active) el.value=val;
+      if(el&&!isDirty(id)) el.value=val;
     }
-    setVal('zip',d.zipcode);
+    setCenterFromStatus(d);
     setVal('zoom',d.zoom);
     setVal('rotation',d.rotation);
     setVal('interval',d.interval);
     const alertEl=document.getElementById('alert_polygons');
-    if(alertEl&&alertEl!==active) alertEl.checked=!!d.alert_polygons;
+    if(alertEl&&!isDirty('alert_polygons')) alertEl.checked=!!d.alert_polygons;
     const bv=parseFloat(d.brightness).toFixed(2);
     const ov=parseFloat(d.radar_opacity).toFixed(2);
-    // Sliders: skip update while user is dragging (focus check)
+    const av=parseFloat(d.alert_fill_opacity).toFixed(2);
     const brightEl=document.getElementById('brightness');
     const opacEl=document.getElementById('radar_opacity');
-    if(brightEl&&brightEl!==active){
+    const alertFillEl=document.getElementById('alert_fill_opacity');
+    if(brightEl&&!isDirty('brightness')){
       brightEl.value=bv;
       document.getElementById('brightVal').textContent=bv;
     }
-    if(opacEl&&opacEl!==active){
+    if(opacEl&&!isDirty('radar_opacity')){
       opacEl.value=ov;
       document.getElementById('opacityVal').textContent=ov;
     }
+    if(alertFillEl&&!isDirty('alert_fill_opacity')){
+      alertFillEl.value=av;
+      document.getElementById('alertFillVal').textContent=av;
+    }
+    const centerText=(d.center_mode==='zip'&&d.zipcode)
+      ? 'ZIP <span>'+d.zipcode+'</span>'
+      : (d.center_mode==='county'&&d.county_code)
+        ? 'County <span>'+d.county_code+'</span> <span>'+d.lat+', '+d.lon+'</span>'
+        : 'Lat/Lon <span>'+d.lat+', '+d.lon+'</span>';
     document.getElementById('box').innerHTML=
       '<div><span class="dot"></span>Status: <span>'+d.status+'</span></div>'+
-      '<div>ZIP <span>'+d.zipcode+'</span> &nbsp;<span style="font-size:.75rem;'+
-      'background:#334155;border-radius:4px;padding:1px 6px">'+d.lat+', '+d.lon+'</span></div>'+
+      '<div>'+centerText+'</div>'+
       '<div>Zoom <span>'+d.zoom+'</span> &nbsp; Rotation <span>'+(d.rotation*90)+
       '&deg;</span> &nbsp; Interval <span>'+d.interval+'s</span></div>'+
-      '<div>Brightness <span>'+bv+'</span> &nbsp; Radar Opacity <span>'+ov+
-      '</span> &nbsp; NWS <span>'+(d.alert_polygons?'On':'Off')+'</span></div>'+
+      '<div>Brightness <span>'+bv+'</span> &nbsp; Radar Opacity <span>'+ov+'</span></div>'+
+      '<div>NWS <span>'+(d.alert_polygons?'On':'Off')+
+      '</span> &nbsp; NWS Fill <span>'+av+'</span></div>'+
       '<div>Frame <span>#'+d.frame+'</span> &nbsp; Last: <span>'+d.last_sent+'</span></div>';
   }catch(e){
     document.getElementById('box').innerHTML='<span class="err">Cannot reach server</span>';
@@ -880,30 +1360,50 @@ async function poll(){
 }
 async function apply(){
   const btn=document.getElementById('btn');
-  const zip=document.getElementById('zip').value.trim();
-  if(!/^\d{5}$/.test(zip)){alert('Enter a valid 5-digit ZIP code');return;}
+  const mode=document.getElementById('center_mode').value;
+  const payload={
+    center_mode:mode,
+    zoom:parseInt(document.getElementById('zoom').value),
+    rotation:parseInt(document.getElementById('rotation').value),
+    interval:parseInt(document.getElementById('interval').value),
+    brightness:parseFloat(document.getElementById('brightness').value),
+    radar_opacity:parseFloat(document.getElementById('radar_opacity').value),
+    alert_polygons:document.getElementById('alert_polygons').checked,
+    alert_fill_opacity:parseFloat(document.getElementById('alert_fill_opacity').value),
+  };
+  if(mode==='zip'){
+    const zip=document.getElementById('zip').value.trim();
+    if(!/^\d{5}$/.test(zip)){alert('Enter a valid 5-digit ZIP code');return;}
+    payload.zipcode=zip;
+  }else if(mode==='county'){
+    const county=document.getElementById('county_code').value.trim().toUpperCase();
+    if(!/^(\d{6}|[A-Z]{2}[CZ]\d{3})$/.test(county)){alert('Enter a 6-digit SAME code or NWS code like NCC183');return;}
+    payload.county_code=county;
+  }else{
+    const lat=parseFloat(document.getElementById('lat').value);
+    const lon=parseFloat(document.getElementById('lon').value);
+    if(!Number.isFinite(lat)||lat<-85||lat>85){alert('Enter latitude from -85 to 85');return;}
+    if(!Number.isFinite(lon)||lon<-180||lon>180){alert('Enter longitude from -180 to 180');return;}
+    payload.lat=lat;
+    payload.lon=lon;
+  }
   btn.disabled=true; btn.textContent='Updating...';
   try{
     const r=await fetch('/api/update',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({
-        zipcode:zip,
-        zoom:parseInt(document.getElementById('zoom').value),
-        rotation:parseInt(document.getElementById('rotation').value),
-        interval:parseInt(document.getElementById('interval').value),
-        brightness:parseFloat(document.getElementById('brightness').value),
-        radar_opacity:parseFloat(document.getElementById('radar_opacity').value),
-        alert_polygons:document.getElementById('alert_polygons').checked,
-      })
+      body:JSON.stringify(payload)
     });
     const d=await r.json();
     if(!d.ok) alert('Error: '+d.error);
-    else poll();
+    else{
+      dirtyFields.clear();
+      poll();
+    }
   }catch(e){alert('Request failed: '+e);}
   btn.disabled=false; btn.textContent='▶ Apply & Update Display Now';
 }
-poll(); setInterval(poll,5000);
+toggleCenterFields(); poll(); setInterval(poll,5000);
 </script>
 </body>
 </html>
@@ -948,14 +1448,27 @@ def make_handler(state: RadarState, trigger: threading.Event):
                 self._send_json(400, {"ok": False, "error": "bad JSON"})
                 return
 
-            zipcode       = str(data.get("zipcode", "")).strip() or None
-            zoom          = int(data["zoom"])           if "zoom"          in data else None
-            rotation      = int(data["rotation"])       if "rotation"      in data else None
-            interval      = int(data["interval"])       if "interval"      in data else None
-            brightness    = float(data["brightness"])   if "brightness"    in data else None
-            radar_opacity = float(data["radar_opacity"]) if "radar_opacity" in data else None
-            alert_polygons = (bool(data["alert_polygons"])
-                              if "alert_polygons" in data else None)
+            try:
+                center_mode   = str(data.get("center_mode", "")).strip().lower()
+                zipcode       = str(data.get("zipcode", "")).strip() or None
+                county_code   = (str(data.get("county_code", "")).strip()
+                                 or str(data.get("same", "")).strip()
+                                 or str(data.get("county", "")).strip()
+                                 or None)
+                lat           = float(data["lat"])          if "lat"           in data else None
+                lon           = float(data["lon"])          if "lon"           in data else None
+                zoom          = int(data["zoom"])           if "zoom"          in data else None
+                rotation      = int(data["rotation"])       if "rotation"      in data else None
+                interval      = int(data["interval"])       if "interval"      in data else None
+                brightness    = float(data["brightness"])   if "brightness"    in data else None
+                radar_opacity = float(data["radar_opacity"]) if "radar_opacity" in data else None
+                alert_polygons = (bool(data["alert_polygons"])
+                                  if "alert_polygons" in data else None)
+                alert_fill_opacity = (float(data["alert_fill_opacity"])
+                                      if "alert_fill_opacity" in data else None)
+            except Exception as e:
+                self._send_json(400, {"ok": False, "error": f"bad value: {e}"})
+                return
 
             if zoom is not None and not (5 <= zoom <= 12):
                 self._send_json(400, {"ok": False, "error": "zoom must be 5-12"})
@@ -972,12 +1485,60 @@ def make_handler(state: RadarState, trigger: threading.Event):
             if radar_opacity is not None and not (0.0 <= radar_opacity <= 1.0):
                 self._send_json(400, {"ok": False, "error": "radar_opacity 0.0-1.0"})
                 return
+            if alert_fill_opacity is not None and not (0.0 <= alert_fill_opacity <= 1.0):
+                self._send_json(400, {"ok": False, "error": "alert_fill_opacity 0.0-1.0"})
+                return
+            if center_mode == "zip":
+                lat = None
+                lon = None
+                county_code = None
+                if not zipcode:
+                    self._send_json(400, {"ok": False, "error": "zipcode is required"})
+                    return
+            elif center_mode == "county":
+                zipcode = None
+                lat = None
+                lon = None
+                if not county_code:
+                    self._send_json(400, {"ok": False, "error": "county_code is required"})
+                    return
+            elif center_mode == "latlon":
+                zipcode = None
+                county_code = None
+                if lat is None or lon is None:
+                    self._send_json(400, {"ok": False, "error": "lat and lon are required"})
+                    return
+                try:
+                    validate_latlon(lat, lon)
+                except Exception as e:
+                    self._send_json(400, {"ok": False, "error": str(e)})
+                    return
+            elif zipcode:
+                lat = None
+                lon = None
+                county_code = None
+            elif county_code:
+                lat = None
+                lon = None
+                zipcode = None
+            elif lat is not None or lon is not None:
+                if lat is None or lon is None:
+                    self._send_json(400, {"ok": False, "error": "lat and lon are required"})
+                    return
+                try:
+                    validate_latlon(lat, lon)
+                except Exception as e:
+                    self._send_json(400, {"ok": False, "error": str(e)})
+                    return
 
-            err = state.update(zipcode=zipcode, zoom=zoom,
+            err = state.update(zipcode=zipcode, county_code=county_code,
+                               zoom=zoom,
                                rotation=rotation, interval=interval,
+                               lat=lat, lon=lon,
                                brightness=brightness,
                                radar_opacity=radar_opacity,
-                               alert_polygons=alert_polygons)
+                               alert_polygons=alert_polygons,
+                               alert_fill_opacity=alert_fill_opacity)
             if err:
                 self._send_json(400, {"ok": False, "error": err})
                 return
@@ -988,6 +1549,171 @@ def make_handler(state: RadarState, trigger: threading.Event):
     return Handler
 
 
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off"):
+            return False
+    raise ValueError(f"invalid boolean {value!r}")
+
+
+def parse_tcp_api_command(line: str) -> tuple[str, dict | None]:
+    """
+    Parse one TCP API command.
+
+    Supported:
+      status
+      help
+      {"zipcode":"27587","zoom":9}
+      {"county_code":"NCC183","zoom":9}
+      {"lat":35.9799,"lon":-78.5097,"zoom":9}
+      zip=27587 zoom=9
+      county=NCC183 zoom=9
+      lat=35.9799 lon=-78.5097 zoom=9
+    """
+    text = line.strip()
+    if not text:
+        raise ValueError("empty command")
+    lowered = text.lower()
+    if lowered in ("help", "?"):
+        return "help", None
+    if lowered in ("status", "info"):
+        return "status", None
+    if text.startswith("{"):
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("JSON command must be an object")
+        return "update", data
+
+    data = {}
+    for token in text.replace(",", " ").split():
+        if "=" not in token:
+            raise ValueError(f"expected key=value token, got {token!r}")
+        key, value = token.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "zip":
+            key = "zipcode"
+        elif key in ("same", "county"):
+            key = "county_code"
+        data[key] = value
+    return "update", data
+
+
+def apply_tcp_api_update(state: RadarState, data: dict) -> str:
+    zipcode = str(data.get("zipcode", "")).strip() or None
+    county_code = str(data.get("county_code", "")).strip() or None
+    lat = float(data["lat"]) if "lat" in data else None
+    lon = float(data["lon"]) if "lon" in data else None
+    zoom = int(data["zoom"]) if "zoom" in data else None
+    rotation = int(data["rotation"]) if "rotation" in data else None
+    interval = int(data["interval"]) if "interval" in data else None
+    brightness = float(data["brightness"]) if "brightness" in data else None
+    radar_opacity = float(data["radar_opacity"]) if "radar_opacity" in data else None
+    alert_polygons = (_coerce_bool(data["alert_polygons"])
+                      if "alert_polygons" in data else None)
+    alert_fill_opacity = (float(data["alert_fill_opacity"])
+                          if "alert_fill_opacity" in data else None)
+
+    if zoom is not None and not (5 <= zoom <= 12):
+        raise ValueError("zoom must be 5-12")
+    if rotation is not None and rotation not in (0, 1, 2, 3):
+        raise ValueError("rotation must be 0-3")
+    if interval is not None and not (30 <= interval <= 3600):
+        raise ValueError("interval 30-3600")
+    if brightness is not None and not (0.25 <= brightness <= 2.0):
+        raise ValueError("brightness 0.25-2.0")
+    if radar_opacity is not None and not (0.0 <= radar_opacity <= 1.0):
+        raise ValueError("radar_opacity 0.0-1.0")
+    if alert_fill_opacity is not None and not (0.0 <= alert_fill_opacity <= 1.0):
+        raise ValueError("alert_fill_opacity 0.0-1.0")
+    if zipcode and county_code:
+        raise ValueError("use only one center: zipcode, county_code, or lat/lon")
+    if zipcode:
+        lat = None
+        lon = None
+    elif county_code:
+        lat = None
+        lon = None
+    elif lat is not None or lon is not None:
+        if lat is None or lon is None:
+            raise ValueError("lat and lon must be provided together")
+        validate_latlon(lat, lon)
+
+    err = state.update(zipcode=zipcode, county_code=county_code,
+                       zoom=zoom, rotation=rotation,
+                       interval=interval, lat=lat, lon=lon,
+                       brightness=brightness,
+                       radar_opacity=radar_opacity,
+                       alert_polygons=alert_polygons,
+                       alert_fill_opacity=alert_fill_opacity)
+    if err:
+        raise ValueError(err)
+    return "updated"
+
+
+def tcp_api_client(conn: socket.socket, addr, state: RadarState,
+                   trigger: threading.Event):
+    with conn:
+        conn.settimeout(300)
+        conn.sendall(
+            b"ESP32 radar API ready. Send JSON or key=value commands; help for examples.\n"
+        )
+        buf = b""
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    command, data = parse_tcp_api_command(
+                        line.decode("utf-8", errors="replace")
+                    )
+                    if command == "help":
+                        reply = {
+                            "ok": True,
+                            "commands": [
+                                "status",
+                                "{\"zipcode\":\"27587\",\"zoom\":9}",
+                                "{\"county_code\":\"NCC183\",\"zoom\":9}",
+                                "{\"lat\":35.9799,\"lon\":-78.5097,\"zoom\":9}",
+                                "zip=27587 zoom=9",
+                                "county=NCC183 zoom=9",
+                                "lat=35.9799 lon=-78.5097 zoom=9",
+                            ],
+                        }
+                    elif command == "status":
+                        reply = {"ok": True, "status": state.info()}
+                    else:
+                        apply_tcp_api_update(state, data or {})
+                        trigger.set()
+                        reply = {"ok": True, "status": state.info()}
+                except Exception as e:
+                    reply = {"ok": False, "error": str(e)}
+                conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
+
+def tcp_api_server(state: RadarState, trigger: threading.Event,
+                   host: str, port: int):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen()
+        while True:
+            conn, addr = server.accept()
+            threading.Thread(
+                target=tcp_api_client,
+                args=(conn, addr, state, trigger),
+                daemon=True,
+            ).start()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # main()
 # ─────────────────────────────────────────────────────────────────────────────
@@ -996,8 +1722,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="IEM NEXRAD radar → ESP32 TFT with live web control UI"
     )
-    parser.add_argument("--zip",      required=True,
+    parser.add_argument("--zip",
                         help="Initial US ZIP code")
+    parser.add_argument("--county",
+                        help="Initial 6-digit SAME or NWS county/zone code, e.g. NCC183")
+    parser.add_argument("--lat", type=float,
+                        help="Initial center latitude")
+    parser.add_argument("--lon", type=float,
+                        help="Initial center longitude")
     parser.add_argument("--host",
                         help="ESP32 IP address for direct TCP mode")
     parser.add_argument("--port",     type=int, default=TCP_PORT,
@@ -1026,28 +1758,68 @@ def main():
                         dest="radar_opacity",
                         help="Radar overlay opacity 0.0-1.0 (default: 1.0)")
     parser.add_argument("--alert-polygons", action="store_true",
-                        help="Start with NWS alert polygon outlines enabled")
+                        help="Start with NWS alert polygons enabled")
+    parser.add_argument("--alert-fill-opacity", type=float,
+                        default=NWS_ALERT_FILL_OPACITY,
+                        help=("NWS alert polygon fill opacity 0.0-1.0 "
+                              f"(default: {NWS_ALERT_FILL_OPACITY})"))
     parser.add_argument("--webport",  type=int, default=8080,
                         help="Web UI port (default: 8080)")
+    parser.add_argument("--api-port", type=int, default=API_PORT,
+                        help=f"TCP control API port (default: {API_PORT})")
+    parser.add_argument("--api-bind", default="0.0.0.0",
+                        help="TCP control API bind address (default: 0.0.0.0)")
     args = parser.parse_args()
 
     if not args.channel_server and not args.host:
         sys.exit("Either --host for direct TCP mode or --channel-server for channel mode is required")
+    if not (0.0 <= args.alert_fill_opacity <= 1.0):
+        sys.exit("--alert-fill-opacity must be between 0.0 and 1.0")
+    initial_centers = sum([
+        bool(args.zip),
+        bool(args.county),
+        args.lat is not None or args.lon is not None,
+    ])
+    if initial_centers > 1:
+        sys.exit("Use only one initial center: --zip, --county, or --lat/--lon")
+    if initial_centers == 0:
+        sys.exit("Initial center required: use --zip, --county, or both --lat and --lon")
 
-    # Resolve initial ZIP
-    print(f"Resolving ZIP {args.zip} ...")
-    try:
-        lat, lon = zip_to_latlon(args.zip)
-    except Exception as e:
-        sys.exit(f"ZIP lookup failed: {e}")
+    if args.zip:
+        print(f"Resolving ZIP {args.zip} ...")
+        try:
+            lat, lon = zip_to_latlon(args.zip)
+        except Exception as e:
+            sys.exit(f"ZIP lookup failed: {e}")
+        zipcode = args.zip
+        county_code = ""
+    elif args.county:
+        print(f"Resolving NWS county/SAME code {args.county} ...")
+        try:
+            lat, lon, county_code = nws_code_to_latlon(args.county)
+        except Exception as e:
+            sys.exit(f"NWS zone lookup failed: {e}")
+        zipcode = ""
+    else:
+        if args.lat is None or args.lon is None:
+            sys.exit("lat and lon must be provided together")
+        lat, lon = args.lat, args.lon
+        zipcode = ""
+        county_code = ""
+        try:
+            validate_latlon(lat, lon)
+        except Exception as e:
+            sys.exit(str(e))
     print(f"  {lat:.4f}, {lon:.4f}")
 
     # Shared state + wakeup trigger
-    state   = RadarState(args.zip, args.zoom, args.rotation,
+    state   = RadarState(zipcode, args.zoom, args.rotation,
                          args.interval, lat, lon,
+                         county_code=county_code,
                          brightness=args.brightness,
                          radar_opacity=args.radar_opacity,
-                         alert_polygons=args.alert_polygons)
+                         alert_polygons=args.alert_polygons,
+                         alert_fill_opacity=args.alert_fill_opacity)
     trigger = threading.Event()
 
     if args.channel_server and not args.no_control:
@@ -1064,9 +1836,21 @@ def main():
         daemon=True,
     ).start()
 
+    threading.Thread(
+        target=nws_alert_worker,
+        args=(state, trigger),
+        daemon=True,
+    ).start()
+
     # Web server (daemon)
     httpd = HTTPServer(("0.0.0.0", args.webport), make_handler(state, trigger))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    threading.Thread(
+        target=tcp_api_server,
+        args=(state, trigger, args.api_bind, args.api_port),
+        daemon=True,
+    ).start()
 
     # Discover the LAN IP so we can print a shareable URL
     try:
@@ -1081,11 +1865,18 @@ def main():
         lan_ip = "localhost"
     print(f"\nWeb UI (this machine) : http://localhost:{args.webport}")
     print(f"Web UI (network)      : http://{lan_ip}:{args.webport}")
+    print(f"TCP control API       : {args.api_bind}:{args.api_port}")
     if args.channel_server:
         print(f"Channel image mode : {args.channel_server}:{args.channel_port}/{args.channel}")
     else:
         print(f"ESP32  : {args.host}:{args.port}")
-    print(f"ZIP={args.zip}  zoom={args.zoom}  "
+    if args.zip:
+        center_label = f"ZIP={args.zip}"
+    elif args.county:
+        center_label = f"County={county_code}"
+    else:
+        center_label = f"lat/lon={lat:.4f},{lon:.4f}"
+    print(f"{center_label}  zoom={args.zoom}  "
           f"rotation={args.rotation}  interval={args.interval}s")
     print("Ctrl+C to exit\n")
 
